@@ -26,8 +26,7 @@ BASE_COLUMNS = {
 }
 
 
-@st.cache_data(show_spinner=False)
-def load_xyz_metadata(dir_path: str, csv_path: Optional[str]) -> pd.DataFrame:
+def _load_xyz_metadata_uncached(dir_path: str, csv_path: Optional[str]) -> pd.DataFrame:
     directory = Path(dir_path).expanduser().resolve()
     if not directory.exists():
         raise FileNotFoundError(f"Directory not found: {directory}")
@@ -282,12 +281,12 @@ def is_scalar(value: Any) -> bool:
     return isinstance(value, (int, float, str, bool, np.number))
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_atoms_from_xyz(path: str) -> Atoms:
     return ase_read(path)
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_atoms_from_ase(db_path: str, row_id: int) -> Atoms:
     with connect(db_path) as handle:
         return handle.get(id=row_id).toatoms()
@@ -299,9 +298,16 @@ def load_atoms_raw(record: pd.Series) -> Atoms:
         return load_atoms_from_ase(record.db_path, int(record.db_id))
     raise ValueError(f"Unsupported source type: {record.source}")
 
+@st.cache_data(show_spinner=False)
 def get_atoms(record: pd.Series) -> Optional[Atoms]:
     try:
         return load_atoms_raw(record)
     except Exception as exc:  # pragma: no cover - defensive
         st.error(f"Failed to load structure for {record.label}: {exc}")
     return None
+
+
+@st.cache_data(show_spinner=False)
+def load_xyz_metadata(dir_path: str, csv_path: Optional[str]) -> pd.DataFrame:
+    """Cached wrapper for loading XYZ metadata."""
+    return _load_xyz_metadata_uncached(dir_path, csv_path)

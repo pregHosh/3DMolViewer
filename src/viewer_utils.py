@@ -10,6 +10,18 @@ from ase import Atoms
 from ase.io import write as ase_write
 
 from src.theme_config import ThemeConfig
+import numpy as np
+
+
+def hash_atoms(atoms: Atoms):
+    """Create a stable hash for an ASE Atoms object."""
+    # A robust hash can be made from positions, numbers, cell, and pbc.
+    # We convert arrays to bytes to ensure consistent hashing.
+    positions_bytes = atoms.get_positions().tobytes()
+    numbers_bytes = atoms.get_atomic_numbers().tobytes()
+    cell_bytes = atoms.get_cell().tobytes()
+    pbc_tuple = tuple(atoms.get_pbc())
+    return (positions_bytes, numbers_bytes, cell_bytes, pbc_tuple)
 
 
 SNAPSHOT_QUALITY_OPTIONS: List[Tuple[str, int]] = [
@@ -49,6 +61,7 @@ def atoms_to_pdb_block(atoms: Atoms) -> str:
     return buffer.getvalue()
 
 
+@st.cache_data(hash_funcs={Atoms: hash_atoms})
 def render_ngl_view(
     atoms: Atoms,
     label: str,

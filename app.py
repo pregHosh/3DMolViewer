@@ -361,6 +361,7 @@ def arrow_key_listener() -> Optional[str]:
         height=0,
     )
 
+@st.cache_data
 def compute_dataset_statistics(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     summary_rows = []
     element_counter = Counter()
