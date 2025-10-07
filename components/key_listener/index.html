@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>3DMolViewer Key Listener</title>
+    <script src="https://unpkg.com/streamlit-component-lib@1.4.0/dist/index.js"></script>
+    <style>html,body{margin:0;padding:0;height:0;overflow:hidden}</style>
+  </head>
+  <body>
+    <script>
+      (function () {
+        const throttleMs = 120;
+        let lastSent = 0;
+
+        function isTypingTarget(el) {
+          if (!el) return false;
+          const tag = el.tagName;
+          if (tag === "INPUT" || tag === "TEXTAREA") return true;
+          const editable = el.getAttribute && el.getAttribute("contenteditable");
+          return editable === "" || editable === "true";
+        }
+
+        function emit(direction) {
+          const now = Date.now();
+          if (now - lastSent < throttleMs) return;
+          lastSent = now;
+          try {
+            Streamlit.setComponentValue({ direction, timestamp: now });
+          } catch (err) {
+            console.error("3dmolviewer key listener failed", err);
+          }
+        }
+
+        function handleKey(event) {
+          if (isTypingTarget(document.activeElement)) return;
+
+          let direction = null;
+          switch (event.key) {
+            case "ArrowRight":
+            case ">":
+            case "Enter":
+              direction = "next";
+              break;
+            case "ArrowLeft":
+            case "<":
+            case "Backspace":
+              direction = "prev";
+              break;
+            default:
+              break;
+          }
+
+          if (direction) {
+            event.preventDefault();
+            emit(direction);
+          }
+        }
+
+        window.addEventListener("keydown", handleKey, { passive: false });
+
+        Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, () => {
+          Streamlit.setComponentReady();
+          Streamlit.setFrameHeight(1);
+        });
+
+        Streamlit.setComponentReady();
+        Streamlit.setFrameHeight(1);
+      })();
+    </script>
+  </body>
+</html>
