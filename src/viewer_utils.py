@@ -10,7 +10,10 @@ from ase import Atoms
 from ase.io import write as ase_write
 
 from src.theme_config import ThemeConfig
-import numpy as np
+
+
+
+
 
 
 def hash_atoms(atoms: Atoms):
@@ -775,3 +778,255 @@ def render_ngl_view(
         '<script src="https://unpkg.com/ngl@2.0.0-dev.39/dist/ngl.js"></script>'
         '<script>' + js + '</script>'
     )
+
+import numpy as np
+
+def atoms_to_xyz_block(atoms: Atoms) -> str:
+    buffer = StringIO()
+    ase_write(buffer, atoms, format="xyz")
+    return buffer.getvalue()
+
+def theme_transparent(color: str) -> str:
+    """Return a transparent RGBA hex string based on a solid hex color."""
+
+    if color.startswith("#") and len(color) == 7:
+        return f"{color}66"
+    return "#00000000"
+
+def add_atom_labels(
+    viewer: Any,
+    atoms: Atoms,
+    label_modes: List[str],
+    theme: ThemeConfig,
+) -> None:
+    """Annotate atoms with labels based on the selected display modes."""
+
+    modes = {mode.replace(" ", "_").lower() for mode in label_modes}
+    if not modes:
+        return
+
+    symbols = atoms.get_chemical_symbols()
+    numbers = atoms.get_atomic_numbers()
+    coords = atoms.get_positions()
+
+    for idx, (symbol, atomic_number) in enumerate(zip(symbols, numbers)):
+        parts: list[str] = []
+        if "symbol" in modes:
+            parts.append(symbol)
+        if "atomic_number" in modes:
+            parts.append(f"Z={int(atomic_number)}")
+        if "atom_index" in modes:
+            parts.append(f"i={idx}")
+        if not parts:
+            continue
+
+        x, y, z = map(float, coords[idx])
+        viewer.addLabel(
+            " | ".join(parts),
+            {
+                "position": {"x": x, "y": y, "z": z},
+                "fontSize": 14,
+                "fontColor": theme.highlight,
+                "backgroundColor": theme_transparent(theme.background),
+                "backgroundOpacity": 0.6,
+                "borderThickness": 0,
+                "alignment": "center",
+                "inFront": True,
+            },
+        )
+
+def add_axes(viewer: Any, atoms: Atoms, scale: float) -> None:
+    """Add RGB axes arrows to the viewer based on the molecule span."""
+
+    positions = atoms.get_positions()
+    span = float(np.ptp(positions, axis=0).max()) or 1.0
+    axis_length = span * scale
+
+    min_coords = positions.min(axis=0)
+    offset = 0.1 * span
+    origin = {
+        "x": float(min_coords[0] - offset),
+        "y": float(min_coords[1] - offset),
+        "z": float(min_coords[2] - offset),
+    }
+    arrows = [
+        ("X-axis", {"x": axis_length, "y": 0.0, "z": 0.0}, "#FF4136"),
+        ("Y-axis", {"x": 0.0, "y": axis_length, "z": 0.0}, "#2ECC40"),
+        ("Z-axis", {"x": 0.0, "y": 0.0, "z": axis_length}, "#0074D9"),
+    ]
+    for name, end, color in arrows:
+        arrow_end = {
+            "x": origin["x"] + end["x"],
+            "y": origin["y"] + end["y"],
+            "z": origin["z"] + end["z"],
+        }
+        viewer.addArrow(
+            {
+                "start": origin,
+                "end": arrow_end,
+                "color": color,
+                "radius": span * 0.008,
+            }
+        )
+        viewer.addLabel(
+            name,
+            {
+                "fontColor": color,
+                "backgroundColor": theme_transparent(color),
+                "fontSize": 14,
+                "position": arrow_end,
+                "inFront": True,
+            },
+        )
+
+def render_3dmol_view(
+    atoms: Atoms,
+    label: str,
+    *,
+    theme: ThemeConfig,
+    height: int,
+    width: int = 700,
+    threedmol_style: str = "stick",
+    threedmol_atom_radius: Optional[float] = None,
+    threedmol_bond_radius: Optional[float] = None,
+    show_axes: bool = False,
+    axis_scale: float = 0.4,
+    label_modes: Optional[List[str]] = None,
+) -> str:
+    xyz_block = atoms_to_xyz_block(atoms)
+
+    payload = {
+        "xyz": xyz_block,
+        "style": threedmol_style,
+        "width": width,
+        "height": height,
+        "label": label,
+        "background": theme.background,
+        "atom_radius": threedmol_atom_radius,
+        "bond_radius": threedmol_bond_radius,
+        "show_axes": show_axes,
+        "axis_scale": axis_scale,
+        "label_modes": label_modes,
+        "theme_highlight": theme.highlight,
+        "theme_background_transparent": theme_transparent(theme.background),
+    }
+
+    js = """
+    function init3Dmol() {
+        var cfg = __PAYLOAD__;
+        let viewer = $3Dmol.createViewer('threedmol-viewer', { backgroundColor: cfg.background });
+        viewer.addModel(cfg.xyz, "xyz");
+        if (cfg.style === "Ball and Stick") {
+            viewer.setStyle({}, {stick: {radius: cfg.bond_radius}, sphere: {radius: cfg.atom_radius}});
+        } else {
+            viewer.setStyle({}, { [cfg.style]: {} });
+        }
+        viewer.zoomTo();
+
+        if (cfg.show_axes) {
+            // Add axes - simplified for 3Dmol, as it doesn't have a direct addArrow
+            // This would require more complex JS to draw lines/cones
+            // For now, we'll just add labels for the axes
+            var positions = viewer.getModel().selectedAtoms({});
+            var min_x = Infinity, min_y = Infinity, min_z = Infinity;
+            var max_x = -Infinity, max_y = -Infinity, max_z = -Infinity;
+            for (var i = 0; i < positions.length; i++) {
+                var p = positions[i].coord;
+                min_x = Math.min(min_x, p.x); max_x = Math.max(max_x, p.x);
+                min_y = Math.min(min_y, p.y); max_y = Math.max(max_y, p.y);
+                min_z = Math.min(min_z, p.z); max_z = Math.max(max_z, p.z);
+            }
+            var span = Math.max(max_x - min_x, max_y - min_y, max_z - min_z) || 1.0;
+            var axis_length = span * cfg.axis_scale;
+            var offset = 0.1 * span;
+            var origin = {x: min_x - offset, y: min_y - offset, z: min_z - offset};
+
+            var arrows = [
+                {name: "X-axis", end: {x: axis_length, y: 0.0, z: 0.0}, color: "#FF4136"},
+                {name: "Y-axis", end: {x: 0.0, y: axis_length, z: 0.0}, color: "#2ECC40"},
+                {name: "Z-axis", end: {x: 0.0, y: 0.0, z: axis_length}, color: "#0074D9"},
+            ];
+
+            arrows.forEach(function(arrow) {
+                var arrow_end = {
+                    x: origin.x + arrow.end.x,
+                    y: origin.y + arrow.end.y,
+                    z: origin.z + arrow.end.z
+                };
+                // 3Dmol doesn't have a direct arrow function, so we'll use labels for now
+                viewer.addLabel(
+                    arrow.name,
+                    {
+                        position: arrow_end,
+                        fontColor: arrow.color,
+                        backgroundColor: cfg.theme_background_transparent,
+                        fontSize: 14,
+                        alignment: "center",
+                        inFront: true,
+                    }
+                );
+            });
+        }
+
+        if (cfg.label_modes && cfg.label_modes.length > 0) {
+            var atoms = viewer.getModel().selectedAtoms({});
+            atoms.forEach(function(atom) {
+                var parts = [];
+                var symbol = atom.elem;
+                var atomic_number = atom.properties.atomicNum;
+                var index = atom.idx;
+
+                var modes = cfg.label_modes.map(m => m.toLowerCase().replace(" ", "_"));
+
+                if (modes.includes("symbol")) {
+                    parts.push(symbol);
+                }
+                if (modes.includes("atomic_number")) {
+                    parts.push("Z=" + atomic_number);
+                }
+                if (modes.includes("atom_index")) {
+                    parts.push("i=" + index);
+                }
+
+                if (parts.length > 0) {
+                    viewer.addLabel(
+                        parts.join(" | "),
+                        {
+                            position: atom,
+                            fontSize: 14,
+                            fontColor: cfg.theme_highlight,
+                            backgroundColor: cfg.theme_background_transparent,
+                            backgroundOpacity: 0.6,
+                            borderThickness: 0,
+                            alignment: "center",
+                            inFront: true,
+                        }
+                    );
+                }
+            });
+        }
+
+        viewer.render();
+    }
+
+    function load3Dmol() {
+        if (typeof $3Dmol !== 'undefined') {
+            init3Dmol();
+            return;
+        }
+        var script = document.createElement('script');
+        script.src = "https://cdnjs.cloudflare.com/ajax/libs/3Dmol/1.4.0/3Dmol-min.js";
+        script.onload = init3Dmol;
+        document.head.appendChild(script);
+    }
+
+    load3Dmol();
+    """
+    js = js.replace("__PAYLOAD__", json.dumps(payload))
+
+    return (
+        f'<div id="threedmol-viewer" style="width: {width}px; height: {height}px; position: relative; margin: 0 auto;"></div>'
+        f'<script>{js}</script>'
+    )
+
+

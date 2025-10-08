@@ -62,7 +62,7 @@ STATS_AUTO_LIMIT = 500
 # Import refactored modules
 from src.theme_config import THEMES, inject_theme_css
 from src.data_loader import load_xyz_metadata, load_ase_metadata, get_atoms, load_atoms_raw
-from src.viewer_utils import render_ngl_view, filter_hydrogens, SNAPSHOT_QUALITY_OPTIONS
+from src.viewer_utils import render_ngl_view, render_3dmol_view, filter_hydrogens, SNAPSHOT_QUALITY_OPTIONS
 from src.plot_utils import build_scatter_figure, plot_controls_panel, plot_and_select, pick_numeric_columns, sanitize_plot_config
 from src.ui_components import sidebar_controls, show_measurement_panel, show_details, navigation_controls
 
@@ -959,40 +959,53 @@ def main() -> None:
             if len(display_atoms) == 0:
                 st.warning("No atoms remain after hiding hydrogens for this structure.")
             else:
-                try:
-                    quality_map = {label: factor for label, factor in SNAPSHOT_QUALITY_OPTIONS}
-                    snapshot_factor = quality_map.get(
-                        viewer_config.get("snapshot_quality", ""), 1
-                    )
-                    snapshot_params = {
-                        "transparent": bool(viewer_config.get("snapshot_transparent", False)),
-                        "factor": snapshot_factor,
-                    }
-                    render_start = perf_counter()
-                    html = render_ngl_view(
+                if viewer_config["viewer_engine"] == "3Dmol":
+                    html = render_3dmol_view(
                         display_atoms,
                         record.label,
                         theme=theme,
-                        sphere_radius=viewer_config["sphere_radius"],
-                        bond_radius=viewer_config["bond_radius"],
-                        interaction_mode=viewer_config["viewer_mode"],
                         height=600,
                         width=700,
-                        representation_style=viewer_config["representation_style"],
-                        label_mode=viewer_config["atom_label"],
-                        snapshot=snapshot_params,
-                    )
-                    _log_perf(
-                        perf_log,
-                        "render_ngl_view",
-                        perf_counter() - render_start,
-                        atoms=int(len(display_atoms)),
-                        label=str(record.label),
+                        threedmol_style=viewer_config["threedmol_style"],
+                        threedmol_atom_radius=viewer_config["threedmol_atom_radius"],
+                        threedmol_bond_radius=viewer_config["threedmol_bond_radius"],
                     )
                     st.components.v1.html(html, height=600, width=700)
-                except Exception as exc:  # pragma: no cover - defensive
-                    st.error(str(exc))
-                    return
+                else:
+                    try:
+                        quality_map = {label: factor for label, factor in SNAPSHOT_QUALITY_OPTIONS}
+                        snapshot_factor = quality_map.get(
+                            viewer_config.get("snapshot_quality", ""), 1
+                        )
+                        snapshot_params = {
+                            "transparent": bool(viewer_config.get("snapshot_transparent", False)),
+                            "factor": snapshot_factor,
+                        }
+                        render_start = perf_counter()
+                        html = render_ngl_view(
+                            display_atoms,
+                            record.label,
+                            theme=theme,
+                            sphere_radius=viewer_config["sphere_radius"],
+                            bond_radius=viewer_config["bond_radius"],
+                            interaction_mode=viewer_config["viewer_mode"],
+                            height=600,
+                            width=700,
+                            representation_style=viewer_config["representation_style"],
+                            label_mode=viewer_config["atom_label"],
+                            snapshot=snapshot_params,
+                        )
+                        _log_perf(
+                            perf_log,
+                            "render_ngl_view",
+                            perf_counter() - render_start,
+                            atoms=int(len(display_atoms)),
+                            label=str(record.label),
+                        )
+                        st.components.v1.html(html, height=600, width=700)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        st.error(str(exc))
+                        return
 
             show_measurement_panel(
                 display_atoms,

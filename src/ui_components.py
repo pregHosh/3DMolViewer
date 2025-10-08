@@ -69,57 +69,83 @@ def sidebar_controls(
     elif show_scatter_controls:
         st.sidebar.info("Add numeric properties to enable scatter plotting.")
 
-    with st.sidebar.expander("3D Viewer", expanded=False):
-        mode_label_to_key = {
-            "Rotate / navigate": "rotate",
-            "Select atom (inspect properties)": "select",
-            "Measurement (auto)": "measurement",
-        }
-        viewer_mode_label = st.selectbox(
-            "Mouse mode",
-            list(mode_label_to_key.keys()),
-            index=0,
-            help="Choose how mouse clicks interact with the 3D viewer.",
-        )
-        viewer_mode = mode_label_to_key[viewer_mode_label]
-        sphere_radius = st.slider("Atom radius", min_value=0.1, max_value=0.8, value=0.3, step=0.05)
-        bond_radius = st.slider("Bond radius", min_value=0.05, max_value=0.4, value=0.12, step=0.01)
-        representation_style = st.selectbox(
-            "Rendering style",
-            [
-                "Ball + Stick",
-                "Licorice",
-                "Spacefilling",
-                "Hyperball",
-                "Line",
-                "Point Cloud",
-                "Surface",
-            ],
-            index=0,
-            help="Choose how the molecule is drawn in the 3D viewer.",
-        )
-        atom_label = st.selectbox(
-            "Atom label",
-            ["None", "Symbol", "Atomic number", "Atom index"],
-            index=0,
-            help="Choose a single annotation to display in the 3D viewer",
-        )
+    with st.sidebar.expander("3D Viewer", expanded=True):
+        viewer_engine = st.selectbox("Viewer Engine", ["NGL", "3Dmol"], index=0)
+
+        if viewer_engine == "NGL":
+            mode_label_to_key = {
+                "Rotate / navigate": "rotate",
+                "Select atom (inspect properties)": "select",
+                "Measurement (auto)": "measurement",
+            }
+            viewer_mode_label = st.selectbox(
+                "Mouse mode",
+                list(mode_label_to_key.keys()),
+                index=0,
+                help="Choose how mouse clicks interact with the 3D viewer.",
+            )
+            viewer_mode = mode_label_to_key[viewer_mode_label]
+            sphere_radius = st.slider("Atom radius", min_value=0.1, max_value=0.8, value=0.3, step=0.05)
+            bond_radius = st.slider("Bond radius", min_value=0.05, max_value=0.4, value=0.12, step=0.01)
+            representation_style = st.selectbox(
+                "Rendering style",
+                [
+                    "Ball + Stick",
+                    "Licorice",
+                    "Spacefilling",
+                    "Hyperball",
+                    "Line",
+                    "Point Cloud",
+                    "Surface",
+                ],
+                index=0,
+                help="Choose how the molecule is drawn in the 3D viewer.",
+            )
+            atom_label = st.selectbox(
+                "Atom label",
+                ["None", "Symbol", "Atomic number", "Atom index"],
+                index=0,
+                help="Choose a single annotation to display in the 3D viewer",
+            )
+            snapshot_transparent = st.checkbox(
+                "Transparent snapshot background",
+                value=False,
+                help="When enabled, PNG exports use a transparent backdrop instead of the theme color.",
+            )
+            snapshot_quality_labels = [label for label, _ in SNAPSHOT_QUALITY_OPTIONS]
+            snapshot_quality = st.selectbox(
+                "Snapshot quality",
+                snapshot_quality_labels,
+                index=0,
+                help="Choose a resolution multiplier for PNG exports.",
+            )
+            threedmol_style = None
+            threedmol_atom_radius = None
+            threedmol_bond_radius = None
+        else:  # 3Dmol
+            viewer_mode = "rotate"
+            sphere_radius = None
+            bond_radius = None
+            representation_style = None
+            atom_label = None
+            snapshot_transparent = None
+            snapshot_quality = None
+            threedmol_style = st.selectbox(
+                "Style",
+                ["stick", "sphere", "line", "cross", "Ball and Stick"],
+                index=4,
+            )
+            if threedmol_style == "Ball and Stick":
+                threedmol_atom_radius = st.slider("Atom radius", min_value=0.1, max_value=1.0, value=0.3, step=0.05)
+                threedmol_bond_radius = st.slider("Bond radius", min_value=0.05, max_value=0.5, value=0.1, step=0.01)
+            else:
+                threedmol_atom_radius = None
+                threedmol_bond_radius = None
+
         show_hydrogens = st.checkbox(
             "Show hydrogen atoms",
             value=True,
             help="Uncheck to hide hydrogens across the viewer, measurements, and metadata tables.",
-        )
-        snapshot_transparent = st.checkbox(
-            "Transparent snapshot background",
-            value=False,
-            help="When enabled, PNG exports use a transparent backdrop instead of the theme color.",
-        )
-        snapshot_quality_labels = [label for label, _ in SNAPSHOT_QUALITY_OPTIONS]
-        snapshot_quality = st.selectbox(
-            "Snapshot quality",
-            snapshot_quality_labels,
-            index=0,
-            help="Choose a resolution multiplier for PNG exports.",
         )
 
     return {
@@ -128,9 +154,13 @@ def sidebar_controls(
         "z_axis": z_axis,
         "color_by": color_by,
         "size_by": size_by,
+        "viewer_engine": viewer_engine,
         "sphere_radius": sphere_radius,
         "bond_radius": bond_radius,
         "representation_style": representation_style,
+        "threedmol_style": threedmol_style,
+        "threedmol_atom_radius": threedmol_atom_radius,
+        "threedmol_bond_radius": threedmol_bond_radius,
         "atom_label": None if atom_label == "None" else atom_label,
         "viewer_mode": viewer_mode,
         "show_hydrogens": show_hydrogens,
