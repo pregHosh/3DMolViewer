@@ -969,6 +969,7 @@ def main() -> None:
                         threedmol_style=viewer_config["threedmol_style"],
                         threedmol_atom_radius=viewer_config["threedmol_atom_radius"],
                         threedmol_bond_radius=viewer_config["threedmol_bond_radius"],
+                        label_modes=[viewer_config["atom_label"]] if viewer_config["atom_label"] else None,
                     )
                     st.components.v1.html(html, height=600, width=700)
                 else:

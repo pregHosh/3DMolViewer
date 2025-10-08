@@ -72,6 +72,13 @@ def sidebar_controls(
     with st.sidebar.expander("3D Viewer", expanded=True):
         viewer_engine = st.selectbox("Viewer Engine", ["NGL", "3Dmol"], index=0)
 
+        atom_label = st.selectbox(
+            "Atom label",
+            ["None", "Symbol", "Atomic number", "Atom index"],
+            index=0,
+            help="Choose a single annotation to display in the 3D viewer",
+        )
+
         if viewer_engine == "NGL":
             mode_label_to_key = {
                 "Rotate / navigate": "rotate",
@@ -101,12 +108,6 @@ def sidebar_controls(
                 index=0,
                 help="Choose how the molecule is drawn in the 3D viewer.",
             )
-            atom_label = st.selectbox(
-                "Atom label",
-                ["None", "Symbol", "Atomic number", "Atom index"],
-                index=0,
-                help="Choose a single annotation to display in the 3D viewer",
-            )
             snapshot_transparent = st.checkbox(
                 "Transparent snapshot background",
                 value=False,
@@ -127,7 +128,6 @@ def sidebar_controls(
             sphere_radius = None
             bond_radius = None
             representation_style = None
-            atom_label = None
             snapshot_transparent = None
             snapshot_quality = None
             threedmol_style = st.selectbox(
