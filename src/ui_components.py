@@ -92,8 +92,8 @@ def sidebar_controls(
                 help="Choose how mouse clicks interact with the 3D viewer.",
             )
             viewer_mode = mode_label_to_key[viewer_mode_label]
-            sphere_radius = st.slider("Atom radius", min_value=0.1, max_value=0.8, value=0.3, step=0.05)
-            bond_radius = st.slider("Bond radius", min_value=0.05, max_value=0.4, value=0.12, step=0.01)
+            sphere_radius = st.slider("Atom radius", min_value=0.1, max_value=0.8, value=0.25, step=0.05)
+            bond_radius = st.slider("Bond radius", min_value=0.05, max_value=0.4, value=0.1, step=0.01)
             representation_style = st.selectbox(
                 "Rendering style",
                 [
@@ -105,7 +105,7 @@ def sidebar_controls(
                     "Point Cloud",
                     "Surface",
                 ],
-                index=0,
+                index=1, # Changed from 0 to 1 for 'Licorice'
                 help="Choose how the molecule is drawn in the 3D viewer.",
             )
             snapshot_transparent = st.checkbox(
@@ -133,11 +133,11 @@ def sidebar_controls(
             threedmol_style = st.selectbox(
                 "Style",
                 ["stick", "sphere", "line", "cross", "Ball and Stick"],
-                index=4,
+                index=0, # Changed from 4 to 0 for 'stick'
             )
             if threedmol_style == "Ball and Stick":
-                threedmol_atom_radius = st.slider("Atom radius", min_value=0.1, max_value=1.0, value=0.3, step=0.05)
-                threedmol_bond_radius = st.slider("Bond radius", min_value=0.05, max_value=0.5, value=0.1, step=0.01)
+                threedmol_atom_radius = st.slider("Atom radius", min_value=0.1, max_value=1.0, value=0.25, step=0.05)
+                threedmol_bond_radius = st.slider("Bond radius", min_value=0.05, max_value=0.5, value=0.08, step=0.01)
             else:
                 threedmol_atom_radius = None
                 threedmol_bond_radius = None

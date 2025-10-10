@@ -8,3 +8,5 @@ streamlit-plotly-events>=0.0.6
 streamlit-hotkeys>=0.5.0
 matplotlib
 seaborn
+pytest
+kaleido
