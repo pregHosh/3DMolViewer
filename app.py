@@ -250,7 +250,7 @@ def xyz_navbar(
         idx = opts.index(selected_id) if selected_id in opts else (0 if opts else -1)
 
         chosen = st.selectbox(
-            "Matches (autocomplete)",
+            "Choose a structure",
             options=opts,
             index=idx if idx >= 0 else 0,
             format_func=lambda sid: label_map.get(sid, sid),
@@ -717,67 +717,17 @@ def main() -> None:
         )
         st.session_state[plot_config_state_key] = current_defaults
 
-        settings_visible_key = "plot_settings_visible"
-        if settings_visible_key not in st.session_state:
-            st.session_state[settings_visible_key] = False
-
         left_col, right_col = st.columns((1, 1))
         with left_col:
-            toggle_label = (
-                "Hide plot settings"
-                if st.session_state[settings_visible_key]
-                else "Show plot settings"
+            plot_config = plot_controls_panel(
+                df, defaults=st.session_state.get(plot_config_state_key)
             )
-            if st.button(
-                f"🎛️ {toggle_label}",
-                key="plot_settings_toggle",
-                type="primary",
-            ):
-                st.session_state[settings_visible_key] = (
-                    not st.session_state[settings_visible_key]
-                )
-
-            if st.session_state[settings_visible_key]:
-                plot_config = plot_controls_panel(
-                    df, defaults=st.session_state[plot_config_state_key]
-                )
-            else:
-                plot_config = st.session_state[plot_config_state_key]
-                summary_bits = [
-                    plot_config["mode"],
-                    f"X={plot_config['x_axis']}",
-                    f"Y={plot_config['y_axis']}",
-                ]
-                if plot_config["mode"] == "3D" and plot_config.get("z_axis"):
-                    summary_bits.append(f"Z={plot_config['z_axis']}")
-                if plot_config.get("color_by"):
-                    summary_bits.append(f"color={plot_config['color_by']}")
-                if plot_config.get("size_by"):
-                    summary_bits.append(f"size={plot_config['size_by']}")
-                st.caption(" · ".join(summary_bits))
-                quick_grid = st.checkbox(
-                    "Show gridlines",
-                    value=plot_config.get("grid", True),
-                    key="plot_quick_grid",
-                )
-                plot_config["grid"] = bool(quick_grid)
 
             plot_config = sanitize_plot_config(plot_config, df)
             st.session_state[plot_config_state_key] = plot_config
 
             build_start = perf_counter()
-            fig = build_scatter_figure(
-                df,
-                x_axis=plot_config["x_axis"],
-                y_axis=plot_config["y_axis"],
-                z_axis=plot_config.get("z_axis"),
-                color_by=plot_config.get("color_by"),
-                size_by=plot_config.get("size_by"),
-                theme=theme,
-                grid=plot_config.get("grid", True),
-                text_size=plot_config.get("text_size", 14),
-                axis_labels=plot_config.get("axis_labels"),
-            )
+            fig = build_scatter_figure(df, theme=theme, **plot_config)
             _log_perf(
                 perf_log,
                 "build_scatter_figure",
@@ -826,19 +776,6 @@ def main() -> None:
                 rows=int(len(df)),
             )
         st.sidebar.divider()
-        sidebar_options, truncated = _limit_options(df["selection_id"], selected_id)
-        selected_id = st.sidebar.selectbox(
-            "Jump directly to a structure",
-            sidebar_options,
-            index=sidebar_options.index(selected_id)
-            if selected_id in sidebar_options
-            else 0,
-            format_func=lambda sid: label_lookup.get(sid, sid),
-        )
-        if truncated:
-            st.sidebar.caption(
-                f"Showing first {SIDEBAR_SELECT_LIMIT} entries. Use the search bar above the viewer for more."
-            )
         st.session_state["selected_id"] = selected_id
         viewer_container = right_col
     else:
@@ -964,14 +901,14 @@ def main() -> None:
                         display_atoms,
                         record.label,
                         theme=theme,
-                        height=600,
-                        width=700,
+                        height=720,
+                        width=840,
                         threedmol_style=viewer_config["threedmol_style"],
                         threedmol_atom_radius=viewer_config["threedmol_atom_radius"],
                         threedmol_bond_radius=viewer_config["threedmol_bond_radius"],
                         label_modes=[viewer_config["atom_label"]] if viewer_config["atom_label"] else None,
                     )
-                    st.components.v1.html(html, height=600, width=700)
+                    st.components.v1.html(html, height=720, width=840)
                 else:
                     try:
                         quality_map = {label: factor for label, factor in SNAPSHOT_QUALITY_OPTIONS}
@@ -990,8 +927,8 @@ def main() -> None:
                             sphere_radius=viewer_config["sphere_radius"],
                             bond_radius=viewer_config["bond_radius"],
                             interaction_mode=viewer_config["viewer_mode"],
-                            height=600,
-                            width=700,
+                            height=720,
+                            width=840,
                             representation_style=viewer_config["representation_style"],
                             label_mode=viewer_config["atom_label"],
                             snapshot=snapshot_params,
@@ -1003,7 +940,7 @@ def main() -> None:
                             atoms=int(len(display_atoms)),
                             label=str(record.label),
                         )
-                        st.components.v1.html(html, height=600, width=700)
+                        st.components.v1.html(html, height=720, width=840)
                     except Exception as exc:  # pragma: no cover - defensive
                         st.error(str(exc))
                         return
@@ -1026,7 +963,7 @@ def main() -> None:
             )
             if not stats_allowed:
                 st.caption(
-                    f"Statistics skipped automatically for large datasets (> {STATS_AUTO_LIMIT}). "
+                f"Statistics skipped automatically for large datasets (> {STATS_AUTO_LIMIT}). "
                     "Enable the checkbox above to compute them on demand."
                 )
         if stats_allowed:
