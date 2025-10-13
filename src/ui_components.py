@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -376,6 +376,43 @@ def show_details(record: pd.Series, atoms: Optional[Atoms], theme: ThemeConfig) 
     if metadata:
         st.markdown("<div class='molviewer-card'><strong>Metadata</strong></div>", unsafe_allow_html=True)
         _render_dataframe(pd.DataFrame([metadata]), theme)
+
+
+def show_multi_details(
+    records: pd.DataFrame,
+    atoms_lookup: Dict[str, Optional[Atoms]],
+    theme: ThemeConfig,
+) -> None:
+    if records.empty:
+        st.info("No metadata available for the current selection.")
+        return
+
+    ordered = records.copy()
+    if "selection_id" in ordered.columns:
+        ordered["selection_id"] = ordered["selection_id"].astype(str)
+
+    basic_rows: List[Dict[str, Any]] = []
+    for _, row in ordered.iterrows():
+        sid = row.get("selection_id")
+        atoms = atoms_lookup.get(sid) if sid is not None else None
+        summary = summarize_atoms(atoms)
+        summary.update(
+            {
+                "label": row.get("label", sid),
+                "selection_id": sid,
+            }
+        )
+        basic_rows.append(summary)
+
+    if basic_rows:
+        st.markdown("<div class='molviewer-card'><strong>Basic information</strong></div>", unsafe_allow_html=True)
+        _render_dataframe(pd.DataFrame(basic_rows), theme)
+
+    metadata_cols = [c for c in ordered.columns if c not in BASE_COLUMNS]
+    if metadata_cols:
+        metadata_df = ordered[["selection_id", "label", *metadata_cols]].copy()
+        st.markdown("<div class='molviewer-card'><strong>Metadata</strong></div>", unsafe_allow_html=True)
+        _render_dataframe(metadata_df, theme)
 
 
 def navigation_controls(df: pd.DataFrame, selected_id: Optional[str]) -> Optional[str]:

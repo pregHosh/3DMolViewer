@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
@@ -18,6 +18,8 @@ BASE_COLUMNS = {
     "__index",
     "has_geometry",
 }
+
+MAX_MULTI_SELECTION = 8
 
 
 @st.cache_data
@@ -343,7 +345,8 @@ def plot_and_select(
     *,
     downloads: Optional[List[Dict[str, Any]]] = None,
     download_error: Optional[str] = None,
-) -> Optional[str]:
+    selection_mode: str = "single",
+) -> Tuple[Optional[str], List[str]]:
     downloads = downloads or []
     st.subheader("Data Exploration")
 
@@ -371,16 +374,29 @@ def plot_and_select(
         st.caption(download_error)
     if df.empty:
         st.info("No data points to display.")
-        return st.session_state.get("selected_id")
+        return st.session_state.get("selected_id"), st.session_state.get("selected_ids", [])
+
+    valid_ids = df["selection_id"].tolist()
+
     selected_id: Optional[str] = st.session_state.get("selected_id")
-    label_lookup = _label_lookup(df)
+    if selected_id not in valid_ids:
+        selected_id = None
+    selected_ids: List[str] = [
+        sid for sid in st.session_state.get("selected_ids", []) if sid in valid_ids
+    ]
+
+    mode = (selection_mode or "single").strip().lower()
+    multi_select_enabled = mode == "multi"
+    selection_modes = ("points", "lasso") if multi_select_enabled else ("points",)
+    prev_plot_selection: List[str] = st.session_state.get("plotly_selected_ids", [])
+    pending_removed_ids: List[str] = st.session_state.pop("pending_removed_ids", [])
 
     plot_state = st.plotly_chart(
         fig,
         use_container_width=True,
         key="scatter_plot",
         on_select="rerun",
-        selection_mode=("points",),
+        selection_mode=selection_modes,
     )
 
     def _normalize_points(state: Any) -> List[Dict[str, Any]]:
@@ -410,28 +426,66 @@ def plot_and_select(
                 points = None
         return points or []
 
-    points = _normalize_points(plot_state)
-    if points:
-        first_point = points[0]
-        candidate: Optional[str] = None
-        custom_data = first_point.get("customdata")
-        if isinstance(custom_data, (list, tuple)) and custom_data:
-            candidate = custom_data[0]
-        point_index = first_point.get("point_number") or first_point.get("pointNumber")
-        if candidate is None and isinstance(point_index, (int, float)):
-            try:
-                candidate = df["selection_id"].iloc[int(point_index)]
-            except Exception:
-                candidate = None
-        if candidate and candidate in df["selection_id"].values:
-            selected_id = candidate
+    def _extract_ids(points: List[Dict[str, Any]]) -> List[str]:
+        extracted: List[str] = []
+        for point in points:
+            candidate: Optional[str] = None
+            custom_data = point.get("customdata")
+            if isinstance(custom_data, (list, tuple)) and custom_data:
+                candidate = custom_data[0]
+            if candidate is None:
+                point_index = point.get("point_number") or point.get("pointNumber")
+                if isinstance(point_index, (int, float)):
+                    idx = int(point_index)
+                    if 0 <= idx < len(df):
+                        candidate = df["selection_id"].iloc[idx]
+            if candidate and candidate in valid_ids:
+                extracted.append(candidate)
+        return extracted
 
+    raw_ids = _extract_ids(_normalize_points(plot_state))
+    new_ids: List[str] = []
+    for sid in raw_ids:
+        if sid not in new_ids:
+            new_ids.append(sid)
+    if pending_removed_ids:
+        new_ids = [sid for sid in new_ids if sid not in pending_removed_ids]
 
+    selection_changed = new_ids != prev_plot_selection
 
-    if selected_id is None and not df.empty:
-        selected_id = df["selection_id"].iloc[0]
+    if multi_select_enabled:
+        if selection_changed:
+            selected_ids = new_ids
+            selected_id = selected_ids[-1] if selected_ids else None
+    else:
+        if selection_changed:
+            if new_ids:
+                selected_id = new_ids[-1]
+                selected_ids = [selected_id]
+            else:
+                selected_id = None
+                selected_ids = []
+
+    if multi_select_enabled and len(selected_ids) > MAX_MULTI_SELECTION:
+        overflow = len(selected_ids) - MAX_MULTI_SELECTION
+        selected_ids = selected_ids[-MAX_MULTI_SELECTION:]
+        st.warning(
+            f"Showing the {MAX_MULTI_SELECTION} most recent selections. "
+            f"Omitted {overflow} earlier item{'s' if overflow != 1 else ''} to keep the layout responsive."
+        )
+        if selected_id not in selected_ids and selected_ids:
+            selected_id = selected_ids[-1]
+
+    if not multi_select_enabled:
+        if selected_id is None and not df.empty:
+            selected_id = df["selection_id"].iloc[0]
+        if selected_id is not None and selected_id not in selected_ids:
+            selected_ids = [selected_id]
+
     st.session_state["selected_id"] = selected_id
-    return selected_id
+    st.session_state["selected_ids"] = selected_ids
+    st.session_state["plotly_selected_ids"] = selected_ids
+    return selected_id, selected_ids
 
 def _label_lookup(df: pd.DataFrame) -> Dict[str, str]:
     return pd.Series(df["label"].values, index=df["selection_id"]).to_dict()

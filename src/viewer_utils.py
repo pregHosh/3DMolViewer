@@ -40,6 +40,14 @@ def sanitize_filename(label: str, suffix: str = ".png") -> str:
     return f"{safe}{suffix}"
 
 
+def _safe_dom_id(value: Optional[str], *, default: str = "viewer") -> str:
+    if not value:
+        return default
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in value)
+    cleaned = cleaned.strip("-")
+    return cleaned or default
+
+
 def filter_hydrogens(atoms: Atoms, *, show_hydrogens: bool) -> Atoms:
     if show_hydrogens:
         return atoms
@@ -892,6 +900,7 @@ def render_3dmol_view(
     show_axes: bool = False,
     axis_scale: float = 0.4,
     label_modes: Optional[List[str]] = None,
+    container_id: Optional[str] = None,
 ) -> str:
     xyz_block = atoms_to_xyz_block(atoms)
 
@@ -1043,9 +1052,11 @@ def render_3dmol_view(
     """
     js = js.replace("__PAYLOAD__", json.dumps(payload))
 
+    dom_id = _safe_dom_id(container_id, default="threedmol-viewer")
+    js = js.replace("threedmol-viewer", dom_id)
+
     return (
-        f'<div id="threedmol-viewer" style="width: {width}px; height: {height}px; position: relative; margin: 0 auto;"></div>'
+        f'<div id="{dom_id}" style="width: {width}px; height: {height}px; position: relative; margin: 0 auto;"></div>'
         f'<script>{js}</script>'
     )
-
 

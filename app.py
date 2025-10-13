@@ -5,10 +5,11 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
-import os
+from ase import Atoms
 # Optional dependency for keyboard shortcuts (legacy API)
 try:
     from st_hotkeys import st_hotkeys as legacy_st_hotkeys  # type: ignore
@@ -64,7 +65,13 @@ from src.theme_config import THEMES, inject_theme_css
 from src.data_loader import load_xyz_metadata, load_ase_metadata, get_atoms, load_atoms_raw
 from src.viewer_utils import render_ngl_view, render_3dmol_view, filter_hydrogens, SNAPSHOT_QUALITY_OPTIONS
 from src.plot_utils import build_scatter_figure, plot_controls_panel, plot_and_select, pick_numeric_columns, sanitize_plot_config
-from src.ui_components import sidebar_controls, show_measurement_panel, show_details, navigation_controls
+from src.ui_components import (
+    sidebar_controls,
+    show_measurement_panel,
+    show_details,
+    navigation_controls,
+    show_multi_details,
+)
 
 
 def _log_perf(
@@ -708,7 +715,14 @@ def main() -> None:
 
     label_lookup = _label_lookup(df)
 
-    selected_id: Optional[str] = None
+    existing_selected_id = st.session_state.get("selected_id")
+    selected_id: Optional[str] = (
+        existing_selected_id if existing_selected_id in df["selection_id"].values else None
+    )
+    selected_ids: List[str] = [
+        sid for sid in st.session_state.get("selected_ids", []) if sid in df["selection_id"].values
+    ]
+    multi_select_enabled = False
 
     if has_numeric:
         plot_config_state_key = "plot_config_state"
@@ -725,6 +739,19 @@ def main() -> None:
 
             plot_config = sanitize_plot_config(plot_config, df)
             st.session_state[plot_config_state_key] = plot_config
+
+            selection_mode_options = ("Single selection", "Multi selection")
+            selection_mode_value = st.radio(
+                "Selection mode",
+                selection_mode_options,
+                key="molviewer_selection_mode",
+                horizontal=True,
+            )
+            multi_select_enabled = selection_mode_value == selection_mode_options[1]
+            if multi_select_enabled:
+                st.caption(
+                    "Tip: use box/lasso selection or click multiple points repeatedly to build your list."
+                )
 
             build_start = perf_counter()
             fig = build_scatter_figure(df, theme=theme, **plot_config)
@@ -763,11 +790,12 @@ def main() -> None:
                 download_error = None
 
             select_start = perf_counter()
-            selected_id = plot_and_select(
+            selected_id, selected_ids = plot_and_select(
                 df,
                 fig,
                 downloads=downloads,
                 download_error=download_error,
+                selection_mode="multi" if multi_select_enabled else "single",
             )
             _log_perf(
                 perf_log,
@@ -777,7 +805,11 @@ def main() -> None:
             )
         st.sidebar.divider()
         st.session_state["selected_id"] = selected_id
-        viewer_container = right_col
+        st.session_state["selected_ids"] = selected_ids
+        if multi_select_enabled:
+            viewer_container = st.container()
+        else:
+            viewer_container = right_col
     else:
         st.sidebar.header("Structure Selection")
         prev_selected = st.session_state.get("selected_id")
@@ -795,162 +827,361 @@ def main() -> None:
                 f"Showing first {SIDEBAR_SELECT_LIMIT} entries. Use the search bar above the viewer for more."
             )
         st.session_state["selected_id"] = selected_id
+        selected_ids = [selected_id] if selected_id else []
+        st.session_state["selected_ids"] = selected_ids
         # Center the standalone viewer when no numeric properties are available
         _, viewer_container, _ = st.columns([1, 2, 1])
 
-    if selected_id is None:
+    if not selected_ids:
         st.info("Select a structure to view its 3D geometry.")
         return
+    if selected_id not in selected_ids:
+        selected_id = selected_ids[-1]
 
     # Keyboard navigation (global)
 
     # Keyboard navigation via optional hotkeys component
     nav_evt = None
-    if legacy_st_hotkeys is not None:
-        hotkey_pressed = legacy_st_hotkeys([
-            ("enter", "Next", ["enter", "ArrowRight", ">"]),
-            ("backspace", "Previous", ["backspace", "ArrowLeft", "<"]),
-        ])
-        if hotkey_pressed == "Next":
-            nav_evt = "next"
-        elif hotkey_pressed == "Previous":
-            nav_evt = "prev"
-    elif hotkeys is not None:
-        # streamlit-hotkeys >=0.5.0 API
-        bindings = []
-        for binding_id, help_label, keys in (
-            ("next", "Next", ("Enter", "ArrowRight", ">")),
-            ("prev", "Previous", ("Backspace", "ArrowLeft", "<")),
-        ):
-            for key_name in keys:
-                bindings.append(
-                    hotkeys.hk(binding_id, key=key_name, help=f"{help_label} ({key_name})")
-                )
-        manager_key = "molviewer-navigation"
-        hotkeys.activate(bindings, key=manager_key)
-        if hotkeys.pressed("next", key=manager_key):
-            nav_evt = "next"
-        elif hotkeys.pressed("prev", key=manager_key):
-            nav_evt = "prev"
-    # The rest of the logic to change the selection remains the same
-    if nav_evt:
-        should_rerun = False
-        options = df["selection_id"].tolist()
-        if options:
-            current_id = st.session_state.get("selected_id", options[0])
-            new_id = current_id
-            try:
-                current_index = options.index(current_id)
-                if nav_evt == "prev":
-                    new_index = (current_index - 1 + len(options)) % len(options)
-                else:  # "next"
-                    new_index = (current_index + 1) % len(options)
-                new_id = options[new_index]
-            except ValueError:
-                new_id = options[0]
-            if st.session_state.get("selected_id") != new_id:
-                st.session_state["selected_id"] = new_id
-                should_rerun = True
+    if not multi_select_enabled:
+        if legacy_st_hotkeys is not None:
+            hotkey_pressed = legacy_st_hotkeys([
+                ("enter", "Next", ["enter", "ArrowRight", ">"]),
+                ("backspace", "Previous", ["backspace", "ArrowLeft", "<"]),
+            ])
+            if hotkey_pressed == "Next":
+                nav_evt = "next"
+            elif hotkey_pressed == "Previous":
+                nav_evt = "prev"
+        elif hotkeys is not None:
+            # streamlit-hotkeys >=0.5.0 API
+            bindings = []
+            for binding_id, help_label, keys in (
+                ("next", "Next", ("Enter", "ArrowRight", ">")),
+                ("prev", "Previous", ("Backspace", "ArrowLeft", "<")),
+            ):
+                for key_name in keys:
+                    bindings.append(
+                        hotkeys.hk(binding_id, key=key_name, help=f"{help_label} ({key_name})")
+                    )
+            manager_key = "molviewer-navigation"
+            hotkeys.activate(bindings, key=manager_key)
+            if hotkeys.pressed("next", key=manager_key):
+                nav_evt = "next"
+            elif hotkeys.pressed("prev", key=manager_key):
+                nav_evt = "prev"
+        # The rest of the logic to change the selection remains the same
+        if nav_evt:
+            should_rerun = False
+            options = df["selection_id"].tolist()
+            if options:
+                current_id = st.session_state.get("selected_id", options[0])
+                new_id = current_id
+                try:
+                    current_index = options.index(current_id)
+                    if nav_evt == "prev":
+                        new_index = (current_index - 1 + len(options)) % len(options)
+                    else:  # "next"
+                        new_index = (current_index + 1) % len(options)
+                    new_id = options[new_index]
+                except ValueError:
+                    new_id = options[0]
+                if st.session_state.get("selected_id") != new_id:
+                    st.session_state["selected_id"] = new_id
+                    should_rerun = True
 
-        if should_rerun:
-            st.rerun()
+            if should_rerun:
+                st.rerun()
 
     with viewer_container:
+        if multi_select_enabled:
+            st.markdown("**Selected structures**")
+            manage_cols = st.columns([4, 1])
+            removal_requests: List[str] = []
+            with manage_cols[0]:
+                for idx, sid in enumerate(selected_ids, start=1):
+                    human_label = label_lookup.get(sid, sid)
+                    st.caption(f"{idx}. {human_label}")
+            with manage_cols[1]:
+                if st.button("Clear selection", key="clear-multi-selection", use_container_width=True):
+                    st.session_state["selected_ids"] = []
+                    st.session_state["selected_id"] = None
+                    st.rerun()
 
-        if source_type == "XYZ Directory":
-            selected_id = xyz_navbar(
-                df,
-                selected_id,
-                debug=debug_enabled,
-                perf_log=perf_log,
-            )
-        else:
-            selected_id = navigation_controls(df, selected_id)
-
-        record = df.loc[df["selection_id"] == selected_id].iloc[0]
-        has_geometry = bool(record.get("has_geometry", True))
-
-        if not has_geometry:
-            st.info(
-                "No XYZ geometry available for this CSV entry. Nothing to show in the 3D viewer."
-            )
-            show_details(record, None, theme)
-        else:
-            load_start = perf_counter()
-            atoms = get_atoms(record)
-            load_entry = _log_perf(
-                perf_log,
-                "load_atoms",
-                perf_counter() - load_start,
-                selection=str(record["selection_id"]),
-                source=str(record["source"]),
-            )
-            if atoms is None:
-                if load_entry is not None:
-                    load_entry["status"] = "failed"
-                st.error("Unable to load atoms for the selected entry.")
-                return
-            display_atoms = filter_hydrogens(
-                atoms, show_hydrogens=viewer_config["show_hydrogens"]
-            )
-            if len(display_atoms) == 0:
-                st.warning("No atoms remain after hiding hydrogens for this structure.")
+            if len(selected_ids) > 1:
+                layout_choice = st.radio(
+                    "Viewer layout",
+                    ("Grid", "Tabs"),
+                    key="molviewer_multi_layout",
+                    horizontal=True,
+                )
             else:
-                if viewer_config["viewer_engine"] == "3Dmol":
+                layout_choice = "Grid"
+                st.session_state.setdefault("molviewer_multi_layout", layout_choice)
+
+            st.caption(
+                "Multi selection renders interactive 3Dmol panels. Switch back to single selection to access NGL tools and measurements."
+            )
+
+            viewer_style = viewer_config.get("threedmol_style") or "stick"
+            viewer_atom_radius = viewer_config.get("threedmol_atom_radius")
+            viewer_bond_radius = viewer_config.get("threedmol_bond_radius")
+            if viewer_style == "Ball and Stick":
+                viewer_atom_radius = viewer_atom_radius or 0.25
+                viewer_bond_radius = viewer_bond_radius or 0.08
+
+            label_modes = (
+                [viewer_config["atom_label"]] if viewer_config["atom_label"] else None
+            )
+            viewer_height = 420
+            viewer_width = 420
+
+            records_for_tables: List[pd.Series] = []
+            atoms_for_tables: Dict[str, Optional[Atoms]] = {}
+            viewer_entries: List[Dict[str, Any]] = []
+
+            for order, sid in enumerate(selected_ids):
+                row = df.loc[df["selection_id"] == sid]
+                if row.empty:
+                    continue
+                record = row.iloc[0]
+                records_for_tables.append(record)
+                has_geometry = bool(record.get("has_geometry", True))
+                if not has_geometry:
+                    viewer_entries.append(
+                        {
+                            "selection_id": sid,
+                            "label": record.label,
+                            "error": "No XYZ geometry available for this entry.",
+                            "order": order,
+                        }
+                    )
+                    atoms_for_tables[sid] = None
+                    continue
+                load_start = perf_counter()
+                atoms = get_atoms(record)
+                load_entry = _log_perf(
+                    perf_log,
+                    "load_atoms_multi",
+                    perf_counter() - load_start,
+                    selection=str(record["selection_id"]),
+                    source=str(record["source"]),
+                )
+                if atoms is None:
+                    if load_entry is not None:
+                        load_entry["status"] = "failed"
+                    viewer_entries.append(
+                        {
+                            "selection_id": sid,
+                            "label": record.label,
+                            "error": "Unable to load atoms for this entry.",
+                            "order": order,
+                        }
+                    )
+                    atoms_for_tables[sid] = None
+                    continue
+                filtered_atoms = filter_hydrogens(
+                    atoms, show_hydrogens=viewer_config["show_hydrogens"]
+                )
+                atoms_for_preview = filtered_atoms if len(filtered_atoms) else atoms
+                viewer_entries.append(
+                    {
+                        "selection_id": sid,
+                        "label": record.label,
+                        "record": record,
+                        "atoms": atoms,
+                        "display_atoms": atoms_for_preview,
+                        "hydrogen_only": len(filtered_atoms) == 0
+                        and not viewer_config["show_hydrogens"],
+                        "order": order,
+                    }
+                )
+                atoms_for_tables[sid] = atoms_for_preview
+
+            if not viewer_entries:
+                st.info(
+                    "No geometries could be loaded for the current selection. Try picking different points."
+                )
+            else:
+                def _render_entry(entry: Dict[str, Any]) -> None:
+                    header_cols = st.columns([4, 1])
+                    with header_cols[0]:
+                        st.markdown(f"**{entry['label']}**")
+                        st.caption(f"Selection ID: {entry['selection_id']}")
+                    with header_cols[1]:
+                        if st.button(
+                            "Remove",
+                            key=f"remove-viewer-{entry['selection_id']}",
+                            use_container_width=True,
+                        ):
+                            removal_requests.append(entry["selection_id"])
+                    if entry.get("error"):
+                        st.warning(entry["error"])
+                        return
+                    if entry.get("hydrogen_only"):
+                        st.caption(
+                            "All atoms were filtered by the hydrogen toggle; showing the full structure instead."
+                        )
+                    display_atoms = entry["display_atoms"]
+                    render_start = perf_counter()
                     html = render_3dmol_view(
                         display_atoms,
-                        record.label,
+                        entry["label"],
                         theme=theme,
-                        height=720,
-                        width=840,
-                        threedmol_style=viewer_config["threedmol_style"],
-                        threedmol_atom_radius=viewer_config["threedmol_atom_radius"],
-                        threedmol_bond_radius=viewer_config["threedmol_bond_radius"],
-                        label_modes=[viewer_config["atom_label"]] if viewer_config["atom_label"] else None,
+                        height=viewer_height,
+                        width=viewer_width,
+                        threedmol_style=viewer_style,
+                        threedmol_atom_radius=viewer_atom_radius,
+                        threedmol_bond_radius=viewer_bond_radius,
+                        label_modes=label_modes,
+                        container_id=f"threedmol-{entry['selection_id']}-{entry['order']}",
                     )
-                    st.components.v1.html(html, height=720, width=840)
+                    _log_perf(
+                        perf_log,
+                        "render_3dmol_view_multi",
+                        perf_counter() - render_start,
+                        atoms=int(len(display_atoms)),
+                        label=str(entry["label"]),
+                    )
+                    st.components.v1.html(html, height=viewer_height, width=viewer_width)
+
+                if layout_choice == "Tabs" and len(viewer_entries) > 1:
+                    tabs = st.tabs([entry["label"] for entry in viewer_entries])
+                    for tab, entry in zip(tabs, viewer_entries):
+                        with tab:
+                            _render_entry(entry)
                 else:
-                    try:
-                        quality_map = {label: factor for label, factor in SNAPSHOT_QUALITY_OPTIONS}
-                        snapshot_factor = quality_map.get(
-                            viewer_config.get("snapshot_quality", ""), 1
+                    per_row = 2
+                    for start in range(0, len(viewer_entries), per_row):
+                        cols = st.columns(
+                            min(per_row, len(viewer_entries) - start)
                         )
-                        snapshot_params = {
-                            "transparent": bool(viewer_config.get("snapshot_transparent", False)),
-                            "factor": snapshot_factor,
-                        }
-                        render_start = perf_counter()
-                        html = render_ngl_view(
+                        for col, entry in zip(
+                            cols, viewer_entries[start : start + per_row]
+                        ):
+                            with col:
+                                _render_entry(entry)
+
+            if removal_requests:
+                st.session_state["selected_ids"] = [
+                    sid for sid in selected_ids if sid not in removal_requests
+                ]
+                st.session_state["selected_id"] = (
+                    st.session_state["selected_ids"][-1]
+                    if st.session_state["selected_ids"]
+                    else None
+                )
+                st.rerun()
+
+            if records_for_tables:
+                records_df = pd.DataFrame(records_for_tables)
+                records_df = records_df.set_index("selection_id")
+                ordered_ids = [
+                    entry["selection_id"] for entry in viewer_entries if "record" in entry
+                ]
+                remaining_ids = [
+                    entry["selection_id"] for entry in viewer_entries if entry.get("error")
+                ]
+                index_order = ordered_ids + remaining_ids
+                index_order = [
+                    sid for sid in index_order if sid in records_df.index
+                ]
+                records_df = records_df.loc[index_order].reset_index()
+                show_multi_details(records_df, atoms_for_tables, theme)
+        else:
+            if source_type == "XYZ Directory":
+                selected_id = xyz_navbar(
+                    df,
+                    selected_id,
+                    debug=debug_enabled,
+                    perf_log=perf_log,
+                )
+            else:
+                selected_id = navigation_controls(df, selected_id)
+
+            record = df.loc[df["selection_id"] == selected_id].iloc[0]
+            has_geometry = bool(record.get("has_geometry", True))
+
+            if not has_geometry:
+                st.info(
+                    "No XYZ geometry available for this CSV entry. Nothing to show in the 3D viewer."
+                )
+                show_details(record, None, theme)
+            else:
+                load_start = perf_counter()
+                atoms = get_atoms(record)
+                load_entry = _log_perf(
+                    perf_log,
+                    "load_atoms",
+                    perf_counter() - load_start,
+                    selection=str(record["selection_id"]),
+                    source=str(record["source"]),
+                )
+                if atoms is None:
+                    if load_entry is not None:
+                        load_entry["status"] = "failed"
+                    st.error("Unable to load atoms for the selected entry.")
+                    return
+                display_atoms = filter_hydrogens(
+                    atoms, show_hydrogens=viewer_config["show_hydrogens"]
+                )
+                if len(display_atoms) == 0:
+                    st.warning("No atoms remain after hiding hydrogens for this structure.")
+                else:
+                    if viewer_config["viewer_engine"] == "3Dmol":
+                        html = render_3dmol_view(
                             display_atoms,
                             record.label,
                             theme=theme,
-                            sphere_radius=viewer_config["sphere_radius"],
-                            bond_radius=viewer_config["bond_radius"],
-                            interaction_mode=viewer_config["viewer_mode"],
                             height=720,
                             width=840,
-                            representation_style=viewer_config["representation_style"],
-                            label_mode=viewer_config["atom_label"],
-                            snapshot=snapshot_params,
-                        )
-                        _log_perf(
-                            perf_log,
-                            "render_ngl_view",
-                            perf_counter() - render_start,
-                            atoms=int(len(display_atoms)),
-                            label=str(record.label),
+                            threedmol_style=viewer_config["threedmol_style"],
+                            threedmol_atom_radius=viewer_config["threedmol_atom_radius"],
+                            threedmol_bond_radius=viewer_config["threedmol_bond_radius"],
+                            label_modes=[viewer_config["atom_label"]] if viewer_config["atom_label"] else None,
                         )
                         st.components.v1.html(html, height=720, width=840)
-                    except Exception as exc:  # pragma: no cover - defensive
-                        st.error(str(exc))
-                        return
+                    else:
+                        try:
+                            quality_map = {label: factor for label, factor in SNAPSHOT_QUALITY_OPTIONS}
+                            snapshot_factor = quality_map.get(
+                                viewer_config.get("snapshot_quality", ""), 1
+                            )
+                            snapshot_params = {
+                                "transparent": bool(viewer_config.get("snapshot_transparent", False)),
+                                "factor": snapshot_factor,
+                            }
+                            render_start = perf_counter()
+                            html = render_ngl_view(
+                                display_atoms,
+                                record.label,
+                                theme=theme,
+                                sphere_radius=viewer_config["sphere_radius"],
+                                bond_radius=viewer_config["bond_radius"],
+                                interaction_mode=viewer_config["viewer_mode"],
+                                height=720,
+                                width=840,
+                                representation_style=viewer_config["representation_style"],
+                                label_mode=viewer_config["atom_label"],
+                                snapshot=snapshot_params,
+                            )
+                            _log_perf(
+                                perf_log,
+                                "render_ngl_view",
+                                perf_counter() - render_start,
+                                atoms=int(len(display_atoms)),
+                                label=str(record.label),
+                            )
+                            st.components.v1.html(html, height=720, width=840)
+                        except Exception as exc:  # pragma: no cover - defensive
+                            st.error(str(exc))
+                            return
 
-            show_measurement_panel(
-                display_atoms,
-                viewer_config["viewer_mode"],
-                key_prefix=f"measure_{selected_id}",
-            )
-            show_details(record, display_atoms if len(display_atoms) else atoms, theme)
+                show_measurement_panel(
+                    display_atoms,
+                    viewer_config["viewer_mode"],
+                    key_prefix=f"measure_{selected_id}",
+                )
+                show_details(record, display_atoms if len(display_atoms) else atoms, theme)
 
     with st.expander("Dataset distributions", expanded=False):
         stats_allowed = True
