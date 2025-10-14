@@ -260,7 +260,7 @@ def plot_controls_panel(
 
             for axis_name, axis_key, col_name in axes_to_configure:
                 st.markdown(f"**{axis_name}-Axis Controls**")
-                
+
                 default_min, default_max = (None, None)
                 if col_name and col_name in df.columns:
                     col_data = pd.to_numeric(df[col_name], errors="coerce").dropna()
@@ -269,23 +269,36 @@ def plot_controls_panel(
                         default_max = float(col_data.max())
 
                 min_state_key = prefixed(f"{axis_key}_min")
-                if st.session_state.get(min_state_key) is None:
-                    st.session_state[min_state_key] = default_min
-                
                 max_state_key = prefixed(f"{axis_key}_max")
-                if st.session_state.get(max_state_key) is None:
+                column_state_key = prefixed(f"{axis_key}_range_column")
+
+                previous_column = st.session_state.get(column_state_key)
+                if previous_column != col_name:
+                    st.session_state[column_state_key] = col_name
+                    st.session_state[min_state_key] = default_min
                     st.session_state[max_state_key] = default_max
+                else:
+                    if min_state_key not in st.session_state:
+                        st.session_state[min_state_key] = default_min
+                    if max_state_key not in st.session_state:
+                        st.session_state[max_state_key] = default_max
 
                 c1, c2, c3 = st.columns(3)
-                
 
-                if st.session_state.get(min_state_key) == 0.0:
+                current_min = st.session_state.get(min_state_key)
+                current_max = st.session_state.get(max_state_key)
+
+                if (
+                    current_min is not None
+                    and current_max is not None
+                    and current_max < current_min
+                ):
+                    st.warning(
+                        f"Min value for {axis_name} cannot be greater than Max value. "
+                        "Resetting to defaults for the selected column."
+                    )
                     st.session_state[min_state_key] = default_min
-                if st.session_state.get(max_state_key) == 0.0:
                     st.session_state[max_state_key] = default_max
-                
-                if st.session_state[max_state_key] < st.session_state[min_state_key]:
-                    st.warning(f"Min value for {axis_name} cannot be greater than Max value. Reverting to previous values.")
 
                 with c1:
                     config[f"{axis_key}_scale"] = st.radio(f"Scale", ["linear", "log"], key=prefixed(f"{axis_key}_scale"), horizontal=True, label_visibility="collapsed")

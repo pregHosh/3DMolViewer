@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
+import hashlib
+import io
+import os
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, List, Optional, Tuple
-
-import os
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from streamlit.components.v1 import html
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -59,9 +61,33 @@ SESSION_DEBUG_KEY = "molviewer_debug_enabled"
 SIDEBAR_SELECT_LIMIT = 1500
 STATS_AUTO_LIMIT = 500
 
+DATASET_STATE_KEY = "_molviewer_dataset_state"
+LITE_DATASET_STATE_KEY = "_molviewer_lite_dataset_state"
+PLOT_CACHE_KEY = "_molviewer_plot_cache"
+PLOT_CACHE_LIMIT = 8
+PLOT_SIGNATURE_KEYS = (
+    "x_axis",
+    "y_axis",
+    "z_axis",
+    "color_by",
+    "size_by",
+    "grid",
+    "marker_size",
+    "color_scheme",
+    "x_scale",
+    "x_min",
+    "x_max",
+    "y_scale",
+    "y_min",
+    "y_max",
+    "z_scale",
+    "z_min",
+    "z_max",
+)
+
 
 # Import refactored modules
-from src.theme_config import THEMES, inject_theme_css
+from src.theme_config import THEMES, ThemeConfig, inject_theme_css
 from src.data_loader import load_xyz_metadata, load_ase_metadata, get_atoms, load_atoms_raw
 from src.viewer_utils import render_ngl_view, render_3dmol_view, filter_hydrogens, SNAPSHOT_QUALITY_OPTIONS
 from src.plot_utils import build_scatter_figure, plot_controls_panel, plot_and_select, pick_numeric_columns, sanitize_plot_config
@@ -72,6 +98,435 @@ from src.ui_components import (
     navigation_controls,
     show_multi_details,
 )
+
+
+def _normalize_path(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    try:
+        return str(Path(path).expanduser().resolve())
+    except Exception:  # pragma: no cover - defensive
+        return str(Path(path).expanduser())
+
+
+def _make_dataset_key(
+    source_type: str,
+    *,
+    xyz_dir: Optional[str] = None,
+    csv_path: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    if source_type == "XYZ Directory":
+        return ("xyz", _normalize_path(xyz_dir), _normalize_path(csv_path))
+    return ("ase", _normalize_path(db_path), "")
+
+
+def _get_dataset_state() -> Dict[str, Any]:
+    return st.session_state.setdefault(DATASET_STATE_KEY, {})
+
+
+def _make_version_key(version: float) -> str:
+    return f"{version:.6f}".replace(".", "_")
+
+
+def _ensure_dataset_loaded(
+    source_type: str,
+    *,
+    xyz_dir: Optional[str] = None,
+    csv_path: Optional[str] = None,
+    db_path: Optional[str] = None,
+    force_reload: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
+    dataset_state = _get_dataset_state()
+    dataset_key = _make_dataset_key(
+        source_type,
+        xyz_dir=xyz_dir,
+        csv_path=csv_path,
+        db_path=db_path,
+    )
+    if (
+        not force_reload
+        and dataset_state.get("key") == dataset_key
+        and "df" in dataset_state
+    ):
+        if "version_key" not in dataset_state and "version" in dataset_state:
+            dataset_state["version_key"] = _make_version_key(dataset_state["version"])
+        return dataset_state["df"], dataset_state, True
+
+    load_start = perf_counter()
+    if source_type == "XYZ Directory":
+        df = load_xyz_metadata(xyz_dir or "", csv_path or None)
+        source_meta = {"directory": str(xyz_dir or "")}
+    else:
+        df = load_ase_metadata(db_path or "")
+        source_meta = {"database": str(db_path or "")}
+    duration = perf_counter() - load_start
+
+    dataset_state.clear()
+    dataset_state.update(
+        {
+            "key": dataset_key,
+            "df": df,
+            "version": perf_counter(),
+            "load_duration": duration,
+            "stats": {},
+            "source_meta": source_meta,
+        }
+    )
+    dataset_state["version_key"] = _make_version_key(dataset_state["version"])
+    st.session_state.pop(PLOT_CACHE_KEY, None)
+    st.session_state.pop("selected_id", None)
+    st.session_state.pop("selected_ids", None)
+    st.session_state.pop("geometry_cache", None)
+    return df, dataset_state, False
+
+
+def _load_lite_dataset(
+    uploaded_file: Any,
+    *,
+    separator: str,
+    force_reload: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any], bool]:
+    """Load a lightweight CSV dataset uploaded by the user."""
+    lite_state = st.session_state.setdefault(LITE_DATASET_STATE_KEY, {})
+    if force_reload:
+        lite_state.clear()
+        st.session_state.pop("geometry_cache", None)
+    if uploaded_file is None:
+        return pd.DataFrame(), lite_state, False
+
+    content = uploaded_file.getvalue()
+    if not content:
+        raise ValueError("Uploaded file is empty.")
+
+    cache_key = hashlib.sha256(content + separator.encode("utf-8")).hexdigest()
+    if lite_state.get("file_hash") == cache_key and "df" in lite_state:
+        return lite_state["df"], lite_state, True
+
+    load_start = perf_counter()
+    try:
+        text = content.decode("utf-8")
+        encoding = "utf-8"
+    except UnicodeDecodeError:
+        text = content.decode("latin-1")
+        encoding = "latin-1"
+
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=separator)
+    except Exception as exc:  # pragma: no cover - depends on input file
+        raise ValueError(f"Unable to parse uploaded CSV: {exc}") from exc
+
+    if df.empty:
+        raise ValueError("Uploaded CSV contains no rows.")
+
+    df = df.copy()
+    original_cols = df.columns.tolist()
+
+    if "__index" not in df.columns:
+        df["__index"] = np.arange(len(df))
+
+    if "selection_id" in df.columns:
+        df.loc[:, "selection_id"] = df["selection_id"].astype(str)
+        if df["selection_id"].duplicated().any() or df["selection_id"].eq("").any():
+            df.loc[:, "selection_id"] = [f"lite_{idx}" for idx in range(len(df))]
+    else:
+        df["selection_id"] = [f"lite_{idx}" for idx in range(len(df))]
+
+    label_source: Optional[str] = None
+    for col in original_cols:
+        if col in BASE_COLUMNS or col == "selection_id":
+            continue
+        if df[col].dtype == object:
+            label_source = col
+            break
+    if label_source is None:
+        label_source = original_cols[0] if original_cols else "__index"
+
+    if "label" in df.columns:
+        df.loc[:, "label"] = df["label"].fillna("").replace({pd.NA: ""}).astype(str)
+    else:
+        df["label"] = df[label_source].fillna("").replace({pd.NA: ""}).astype(str)
+
+    if "identifier" in df.columns:
+        df.loc[:, "identifier"] = (
+            df["identifier"].fillna("").replace({pd.NA: ""}).astype(str)
+        )
+    else:
+        df["identifier"] = df["label"]
+
+    if "has_geometry" in df.columns:
+        df.loc[:, "has_geometry"] = df["has_geometry"].fillna(False).astype(bool)
+    else:
+        df["has_geometry"] = False
+
+    if "source" in df.columns:
+        df.loc[:, "source"] = df["source"].fillna("").replace({pd.NA: ""}).astype(str)
+    else:
+        df["source"] = "lite"
+
+    if "path" in df.columns:
+        df.loc[:, "path"] = df["path"].fillna("").replace({pd.NA: ""}).astype(str)
+    else:
+        df["path"] = ""
+
+    if "db_path" in df.columns:
+        df.loc[:, "db_path"] = df["db_path"].fillna("").replace({pd.NA: ""}).astype(str)
+    else:
+        df["db_path"] = ""
+
+    if "db_id" in df.columns:
+        df.loc[:, "db_id"] = df["db_id"].fillna("").replace({pd.NA: ""}).astype(str)
+    else:
+        df["db_id"] = ""
+
+    duration = perf_counter() - load_start
+    version = perf_counter()
+
+    lite_state.clear()
+    lite_state.update(
+        {
+            "df": df,
+            "file_hash": cache_key,
+            "load_duration": duration,
+            "version": version,
+            "key": ("lite", uploaded_file.name or "<uploaded>", ""),
+            "stats": {},
+            "source_meta": {
+                "filename": uploaded_file.name or "",
+                "encoding": encoding,
+                "separator": separator,
+                "rows": len(df),
+                "columns": len(df.columns),
+            },
+        }
+    )
+    lite_state["version_key"] = _make_version_key(version)
+    st.session_state.pop("geometry_cache", None)
+    return df, lite_state, False
+
+
+def _resolve_geometry_path(raw_value: Any, base_dir: str) -> tuple[str, bool]:
+    """Resolve a geometry file path from a CSV value."""
+    if raw_value is None:
+        return "", False
+    value = str(raw_value).strip()
+    if not value or value.lower() in {"nan", "none"}:
+        return "", False
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute() and base_dir:
+        candidate = Path(base_dir).expanduser() / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+    except Exception:  # pragma: no cover - defensive
+        resolved = candidate
+    exists = resolved.exists()
+    return str(resolved), exists
+
+
+def _configure_lite_geometry(
+    df: pd.DataFrame, dataset_state: Dict[str, Any]
+) -> pd.DataFrame:
+    """Allow users to map lite CSV columns to geometry files."""
+    string_columns = [
+        col
+        for col in df.select_dtypes(include=["object", "string"]).columns
+        if col not in BASE_COLUMNS and col != "selection_id"
+    ]
+    geometry_state: Dict[str, Any] = dataset_state.setdefault(
+        "lite_geometry_config", {}
+    )
+    previous_config = {
+        "column": geometry_state.get("column"),
+        "base_dir": geometry_state.get("base_dir", ""),
+    }
+    with st.sidebar.expander("Lite geometry mapping", expanded=False):
+        if not string_columns:
+            st.caption("No text columns detected for geometry mapping.")
+            selected_column = None
+            base_directory = ""
+        else:
+            options = ["None"] + sorted(string_columns)
+            current_column = geometry_state.get("column")
+            if current_column not in string_columns:
+                current_column = None
+            default_index = options.index(current_column) if current_column else 0
+            selected_option = st.selectbox(
+                "Column containing geometry file paths",
+                options,
+                index=default_index,
+            )
+            selected_column = (
+                selected_option if selected_option != "None" else None
+            )
+            base_directory = st.text_input(
+                "Base directory (optional)",
+                value=geometry_state.get("base_dir", ""),
+                help="Prepended to relative paths before file lookup.",
+            )
+            summary = dataset_state.get("lite_geometry_report")
+            if summary and selected_column:
+                st.caption(
+                    f"Found {summary.get('available', 0)} geometries "
+                    f"({summary.get('missing', 0)} missing files)."
+                )
+
+    new_config = {"column": selected_column, "base_dir": base_directory.strip()}
+    geometry_changed = new_config != previous_config
+    geometry_state.update(new_config)
+
+    df_modified = df.copy()
+
+    # Always reset previously injected lite geometry rows
+    previous_mask = df_modified["source"] == "lite_xyz"
+    if previous_mask.any():
+        df_modified.loc[previous_mask, "source"] = "lite"
+        df_modified.loc[previous_mask, "path"] = ""
+        df_modified.loc[previous_mask, "has_geometry"] = False
+
+    report = {"enabled": False, "available": 0, "missing": 0, "total": len(df_modified)}
+
+    if selected_column:
+        report["enabled"] = True
+        resolved_series = df_modified[selected_column].apply(
+            lambda value: _resolve_geometry_path(value, new_config["base_dir"])
+        )
+        resolved_paths = resolved_series.apply(lambda pair: pair[0])
+        exists_series = resolved_series.apply(lambda pair: bool(pair[1]))
+        nonempty_mask = resolved_paths.astype(str).str.len() > 0
+
+        if nonempty_mask.any():
+            df_modified.loc[nonempty_mask, "path"] = resolved_paths[nonempty_mask]
+            df_modified.loc[nonempty_mask, "source"] = "lite_xyz"
+            df_modified.loc[nonempty_mask, "has_geometry"] = exists_series[nonempty_mask]
+            report["available"] = int(exists_series[nonempty_mask].sum())
+            missing_mask = nonempty_mask & ~exists_series
+            report["missing"] = int(missing_mask.sum())
+
+    dataset_state["lite_geometry_report"] = report
+    dataset_state["df"] = df_modified
+
+    if geometry_changed:
+        dataset_state["version"] = perf_counter()
+        dataset_state["version_key"] = _make_version_key(dataset_state["version"])
+        dataset_state["stats"] = {}
+        st.session_state.pop(PLOT_CACHE_KEY, None)
+        st.session_state.pop("geometry_cache", None)
+
+    return df_modified
+
+
+def _load_atoms_cached(
+    record: pd.Series,
+    dataset_state: Dict[str, Any],
+    perf_log: Optional[List[Dict[str, Any]]],
+    event_base: str,
+) -> Optional[Atoms]:
+    """Load atoms, caching results per dataset version and selection."""
+    cache: Dict[Tuple[str, str], Optional[Atoms]] = st.session_state.setdefault(
+        "geometry_cache", {}
+    )
+    version_key = dataset_state.get("version_key", "global")
+    selection_key = str(record.get("selection_id"))
+    cache_key = (version_key, selection_key)
+
+    if cache_key in cache:
+        _log_perf(
+            perf_log,
+            f"{event_base}_cached",
+            0.0,
+            selection=selection_key,
+            source=str(record.get("source")),
+        )
+        return cache[cache_key]
+
+    load_start = perf_counter()
+    atoms = get_atoms(record)
+    duration = perf_counter() - load_start
+    entry = _log_perf(
+        perf_log,
+        event_base,
+        duration,
+        selection=selection_key,
+        source=str(record.get("source")),
+    )
+    if atoms is None and entry is not None:
+        entry["status"] = "failed"
+    cache[cache_key] = atoms
+    return atoms
+
+
+def _normalize_plot_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+    return str(value)
+
+
+def _make_plot_cache_key(
+    dataset_state: Dict[str, Any],
+    plot_config: Dict[str, Any],
+    theme_name: str,
+) -> Tuple[Any, ...]:
+    signature = tuple(
+        (key, _normalize_plot_value(plot_config.get(key)))
+        for key in PLOT_SIGNATURE_KEYS
+    )
+    return (dataset_state.get("key"), dataset_state.get("version"), theme_name, signature)
+
+
+def _get_scatter_figure(
+    df: pd.DataFrame,
+    plot_config: Dict[str, Any],
+    theme: ThemeConfig,
+    theme_name: str,
+    dataset_state: Dict[str, Any],
+) -> Tuple[Any, bool, float]:
+    cache: OrderedDict = st.session_state.setdefault(PLOT_CACHE_KEY, OrderedDict())
+    cache_key = _make_plot_cache_key(dataset_state, plot_config, theme_name)
+    cached_fig = cache.get(cache_key)
+    if cached_fig is not None:
+        cache.move_to_end(cache_key)
+        return cached_fig, True, 0.0
+
+    build_start = perf_counter()
+    fig = build_scatter_figure(df, theme=theme, **plot_config)
+    duration = perf_counter() - build_start
+    cache[cache_key] = fig
+    cache.move_to_end(cache_key)
+    while len(cache) > PLOT_CACHE_LIMIT:
+        cache.popitem(last=False)
+    return fig, False, duration
+
+
+def _get_dataset_statistics(
+    df: pd.DataFrame,
+    dataset_state: Dict[str, Any],
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], bool]:
+    stats_bucket = dataset_state.setdefault("stats", {})
+    dataset_version = dataset_state.get("version")
+    if stats_bucket.get("version") == dataset_version:
+        return (
+            stats_bucket.get("summary", pd.DataFrame()),
+            stats_bucket.get("elements", pd.DataFrame()),
+            stats_bucket.get("failures", []),
+            True,
+        )
+
+    summary_df, elements_df, failures = compute_dataset_statistics(df)
+    stats_bucket.update(
+        {
+            "version": dataset_version,
+            "summary": summary_df,
+            "elements": elements_df,
+            "failures": failures,
+        }
+    )
+    return summary_df, elements_df, failures, False
 
 
 def _log_perf(
@@ -289,7 +744,6 @@ def arrow_key_listener() -> Optional[str]:
     """
     Waits for Streamlit to be ready, then attaches a robust keyboard listener.
     """
-    from streamlit.components.v1 import html
     return html(
         """
         <script>
@@ -628,9 +1082,68 @@ def main() -> None:
     perf_log: Optional[List[Dict[str, Any]]] = [] if debug_enabled else None
 
     st.sidebar.header("Data Source")
-    source_type = st.sidebar.radio("Source", ["XYZ Directory", "ASE Database"], index=0)
+    source_options = ["Lite CSV Upload", "XYZ Directory", "ASE Database"]
+    source_type = st.sidebar.radio("Source", source_options, index=1)
+    reload_requested = st.sidebar.button("Reload data", key="molviewer_reload")
+    if reload_requested:
+        st.session_state.pop(DATASET_STATE_KEY, None)
+        st.session_state.pop(LITE_DATASET_STATE_KEY, None)
+        st.session_state.pop(PLOT_CACHE_KEY, None)
+        st.session_state.pop("selected_id", None)
+        st.session_state.pop("selected_ids", None)
+        st.session_state.pop("geometry_cache", None)
+
+    dataset_state: Dict[str, Any] = {}
+
     try:
-        if source_type == "XYZ Directory":
+        if source_type == "Lite CSV Upload":
+            st.sidebar.caption(
+                "Upload a CSV file for quick property exploration. "
+                "A `label` column will be inferred if missing."
+            )
+            separator_options = {
+                "Comma (,)": ",",
+                "Semicolon (;)": ";",
+                "Tab (\\t)": "\t",
+                "Pipe (|)": "|",
+            }
+            separator_choice = st.sidebar.selectbox(
+                "Separator",
+                list(separator_options.keys()),
+                index=0,
+            )
+            uploaded_file = st.sidebar.file_uploader(
+                "Upload CSV file",
+                type=["csv", "txt"],
+                key="lite_dataset_upload",
+            )
+            if uploaded_file is None:
+                st.info("Upload a CSV file to begin.")
+                return
+
+            df, dataset_state, dataset_cache_hit = _load_lite_dataset(
+                uploaded_file,
+                separator=separator_options[separator_choice],
+                force_reload=reload_requested,
+            )
+            if perf_log is not None:
+                event_name = (
+                    "load_lite_dataset_cached"
+                    if dataset_cache_hit
+                    else "load_lite_dataset"
+                )
+                duration = (
+                    0.0 if dataset_cache_hit else dataset_state.get("load_duration", 0.0)
+                )
+                _log_perf(
+                    perf_log,
+                    event_name,
+                    duration,
+                    filename=getattr(uploaded_file, "name", ""),
+                    records=int(len(df)),
+                )
+            df = _configure_lite_geometry(df, dataset_state)
+        elif source_type == "XYZ Directory":
             default_xyz_dir = DEFAULT_XYZ_DIR if Path(DEFAULT_XYZ_DIR).exists() else ""
             xyz_dir = st.sidebar.text_input("XYZ directory", value=default_xyz_dir)
             default_csv = PACKAGE_ROOT / "test_xyz" / "xyz_properties.csv"
@@ -641,16 +1154,22 @@ def main() -> None:
             if not xyz_dir:
                 st.info("Provide a directory containing .xyz files to begin.")
                 return
-            start = perf_counter()
-            df = load_xyz_metadata(xyz_dir, csv_path or None)
- 
-            _log_perf(
-                perf_log,
-                "load_xyz_metadata",
-                perf_counter() - start,
-                directory=str(xyz_dir),
-                records=int(len(df)),
+            df, dataset_state, dataset_cache_hit = _ensure_dataset_loaded(
+                source_type,
+                xyz_dir=xyz_dir,
+                csv_path=csv_path,
+                force_reload=reload_requested,
             )
+            if perf_log is not None:
+                event_name = "load_xyz_metadata_cached" if dataset_cache_hit else "load_xyz_metadata"
+                duration = 0.0 if dataset_cache_hit else dataset_state.get("load_duration", 0.0)
+                _log_perf(
+                    perf_log,
+                    event_name,
+                    duration,
+                    directory=_normalize_path(xyz_dir),
+                    records=int(len(df)),
+                )
             if df.attrs.get("csv_properties_ignored"):
                 ignored_path = df.attrs.get("csv_properties_path") or csv_path or "property CSV"
                 st.warning(
@@ -671,15 +1190,21 @@ def main() -> None:
             if not db_path:
                 st.info("Provide a path to an ASE database (.db) file to begin.")
                 return
-            start = perf_counter()
-            df = load_ase_metadata(db_path)
-            _log_perf(
-                perf_log,
-                "load_ase_metadata",
-                perf_counter() - start,
-                database=str(db_path),
-                records=int(len(df)),
+            df, dataset_state, dataset_cache_hit = _ensure_dataset_loaded(
+                source_type,
+                db_path=db_path,
+                force_reload=reload_requested,
             )
+            if perf_log is not None:
+                event_name = "load_ase_metadata_cached" if dataset_cache_hit else "load_ase_metadata"
+                duration = 0.0 if dataset_cache_hit else dataset_state.get("load_duration", 0.0)
+                _log_perf(
+                    perf_log,
+                    event_name,
+                    duration,
+                    database=_normalize_path(db_path),
+                    records=int(len(df)),
+                )
     except Exception as exc:
         st.error(str(exc))
         return
@@ -708,6 +1233,8 @@ def main() -> None:
                     f"**{item['phase']}** — {item['seconds']:.3f} s{suffix}"
                 )
 
+    version_key = dataset_state.get("version_key", "global")
+
     has_numeric = bool(pick_numeric_columns(df))
     viewer_config = sidebar_controls(
         df, enable_scatter=has_numeric, show_scatter_controls=False
@@ -725,7 +1252,7 @@ def main() -> None:
     multi_select_enabled = False
 
     if has_numeric:
-        plot_config_state_key = "plot_config_state"
+        plot_config_state_key = f"plot_config_state_{version_key}"
         current_defaults = sanitize_plot_config(
             st.session_state.get(plot_config_state_key), df
         )
@@ -734,7 +1261,9 @@ def main() -> None:
         left_col, right_col = st.columns((1, 1))
         with left_col:
             plot_config = plot_controls_panel(
-                df, defaults=st.session_state.get(plot_config_state_key)
+                df,
+                key_prefix=f"plot_{version_key}",
+                defaults=st.session_state.get(plot_config_state_key),
             )
 
             plot_config = sanitize_plot_config(plot_config, df)
@@ -753,14 +1282,21 @@ def main() -> None:
                     "Tip: use box/lasso selection or click multiple points repeatedly to build your list."
                 )
 
-            build_start = perf_counter()
-            fig = build_scatter_figure(df, theme=theme, **plot_config)
-            _log_perf(
-                perf_log,
-                "build_scatter_figure",
-                perf_counter() - build_start,
-                rows=int(len(df)),
+            fig, fig_cached, build_duration = _get_scatter_figure(
+                df,
+                plot_config,
+                theme,
+                theme_name,
+                dataset_state,
             )
+            if perf_log is not None:
+                event_name = "build_scatter_figure_cached" if fig_cached else "build_scatter_figure"
+                _log_perf(
+                    perf_log,
+                    event_name,
+                    build_duration,
+                    rows=int(len(df)),
+                )
             downloads: List[Dict[str, Any]] = []
             download_error: Optional[str] = None
             filename_base = f"{plot_config['y_axis']}_vs_{plot_config['x_axis']}"
@@ -919,8 +1455,27 @@ def main() -> None:
                 st.session_state.setdefault("molviewer_multi_layout", layout_choice)
 
             st.caption(
-                "Multi selection renders interactive 3Dmol panels. Switch back to single selection to access NGL tools and measurements."
+                "Enable the 3D viewer below to load structures on demand. Switch back to single selection to access NGL tools and measurements."
             )
+
+            dataset_has_geometry = (
+                bool(df["has_geometry"].astype(bool).any())
+                if "has_geometry" in df.columns
+                else False
+            )
+            viewer_state_key = f"viewer_enabled_{version_key}"
+            default_viewer_enabled = st.session_state.get(viewer_state_key, False)
+            if not dataset_has_geometry and viewer_state_key in st.session_state:
+                st.session_state[viewer_state_key] = False
+            viewer_checkbox = st.checkbox(
+                "Enable 3D viewer",
+                value=default_viewer_enabled if dataset_has_geometry else False,
+                key=viewer_state_key,
+                disabled=not dataset_has_geometry,
+                help="Load molecular geometries on demand."
+                + ("" if dataset_has_geometry else " No geometries detected for this dataset."),
+            )
+            viewer_enabled = bool(viewer_checkbox and dataset_has_geometry)
 
             viewer_style = viewer_config.get("threedmol_style") or "stick"
             viewer_atom_radius = viewer_config.get("threedmol_atom_radius")
@@ -935,6 +1490,12 @@ def main() -> None:
             viewer_height = 420
             viewer_width = 420
 
+            geometry_message: Optional[str] = None
+            if not dataset_has_geometry:
+                geometry_message = "No geometries were detected for this dataset. Use the tables below for metadata instead."
+            elif not viewer_enabled:
+                geometry_message = "Enable the 3D viewer above to fetch geometries for the current selection."
+
             records_for_tables: List[pd.Series] = []
             atoms_for_tables: Dict[str, Optional[Atoms]] = {}
             viewer_entries: List[Dict[str, Any]] = []
@@ -945,6 +1506,11 @@ def main() -> None:
                     continue
                 record = row.iloc[0]
                 records_for_tables.append(record)
+                atoms_for_tables.setdefault(sid, None)
+
+                if geometry_message is not None:
+                    continue
+
                 has_geometry = bool(record.get("has_geometry", True))
                 if not has_geometry:
                     viewer_entries.append(
@@ -955,20 +1521,14 @@ def main() -> None:
                             "order": order,
                         }
                     )
-                    atoms_for_tables[sid] = None
                     continue
-                load_start = perf_counter()
-                atoms = get_atoms(record)
-                load_entry = _log_perf(
+                atoms = _load_atoms_cached(
+                    record,
+                    dataset_state,
                     perf_log,
                     "load_atoms_multi",
-                    perf_counter() - load_start,
-                    selection=str(record["selection_id"]),
-                    source=str(record["source"]),
                 )
                 if atoms is None:
-                    if load_entry is not None:
-                        load_entry["status"] = "failed"
                     viewer_entries.append(
                         {
                             "selection_id": sid,
@@ -977,7 +1537,6 @@ def main() -> None:
                             "order": order,
                         }
                     )
-                    atoms_for_tables[sid] = None
                     continue
                 filtered_atoms = filter_hydrogens(
                     atoms, show_hydrogens=viewer_config["show_hydrogens"]
@@ -997,96 +1556,94 @@ def main() -> None:
                 )
                 atoms_for_tables[sid] = atoms_for_preview
 
-            if not viewer_entries:
-                st.info(
-                    "No geometries could be loaded for the current selection. Try picking different points."
-                )
+            if geometry_message is not None:
+                st.info(geometry_message)
             else:
-                def _render_entry(entry: Dict[str, Any]) -> None:
-                    header_cols = st.columns([4, 1])
-                    with header_cols[0]:
-                        st.markdown(f"**{entry['label']}**")
-                        st.caption(f"Selection ID: {entry['selection_id']}")
-                    with header_cols[1]:
-                        if st.button(
-                            "Remove",
-                            key=f"remove-viewer-{entry['selection_id']}",
-                            use_container_width=True,
-                        ):
-                            removal_requests.append(entry["selection_id"])
-                    if entry.get("error"):
-                        st.warning(entry["error"])
-                        return
-                    if entry.get("hydrogen_only"):
-                        st.caption(
-                            "All atoms were filtered by the hydrogen toggle; showing the full structure instead."
-                        )
-                    display_atoms = entry["display_atoms"]
-                    render_start = perf_counter()
-                    html = render_3dmol_view(
-                        display_atoms,
-                        entry["label"],
-                        theme=theme,
-                        height=viewer_height,
-                        width=viewer_width,
-                        threedmol_style=viewer_style,
-                        threedmol_atom_radius=viewer_atom_radius,
-                        threedmol_bond_radius=viewer_bond_radius,
-                        label_modes=label_modes,
-                        container_id=f"threedmol-{entry['selection_id']}-{entry['order']}",
+                if not viewer_entries:
+                    st.info(
+                        "No geometries could be loaded for the current selection. Try picking different points."
                     )
-                    _log_perf(
-                        perf_log,
-                        "render_3dmol_view_multi",
-                        perf_counter() - render_start,
-                        atoms=int(len(display_atoms)),
-                        label=str(entry["label"]),
-                    )
-                    st.components.v1.html(html, height=viewer_height, width=viewer_width)
-
-                if layout_choice == "Tabs" and len(viewer_entries) > 1:
-                    tabs = st.tabs([entry["label"] for entry in viewer_entries])
-                    for tab, entry in zip(tabs, viewer_entries):
-                        with tab:
-                            _render_entry(entry)
                 else:
-                    per_row = 2
-                    for start in range(0, len(viewer_entries), per_row):
-                        cols = st.columns(
-                            min(per_row, len(viewer_entries) - start)
+                    def _render_entry(entry: Dict[str, Any]) -> None:
+                        header_cols = st.columns([4, 1])
+                        with header_cols[0]:
+                            st.markdown(f"**{entry['label']}**")
+                            st.caption(f"Selection ID: {entry['selection_id']}")
+                        with header_cols[1]:
+                            if st.button(
+                                "Remove",
+                                key=f"remove-viewer-{entry['selection_id']}",
+                                use_container_width=True,
+                            ):
+                                removal_requests.append(entry["selection_id"])
+                        if entry.get("error"):
+                            st.warning(entry["error"])
+                            return
+                        if entry.get("hydrogen_only"):
+                            st.caption(
+                                "All atoms were filtered by the hydrogen toggle; showing the full structure instead."
+                            )
+                        display_atoms = entry["display_atoms"]
+                        render_start = perf_counter()
+                        html = render_3dmol_view(
+                            display_atoms,
+                            entry["label"],
+                            theme=theme,
+                            height=viewer_height,
+                            width=viewer_width,
+                            threedmol_style=viewer_style,
+                            threedmol_atom_radius=viewer_atom_radius,
+                            threedmol_bond_radius=viewer_bond_radius,
+                            label_modes=label_modes,
+                            container_id=f"threedmol-{entry['selection_id']}-{entry['order']}",
                         )
-                        for col, entry in zip(
-                            cols, viewer_entries[start : start + per_row]
-                        ):
-                            with col:
-                                _render_entry(entry)
+                        _log_perf(
+                            perf_log,
+                            "render_3dmol_view_multi",
+                            perf_counter() - render_start,
+                            atoms=int(len(display_atoms)),
+                            label=str(entry["label"]),
+                        )
+                        st.components.v1.html(html, height=viewer_height, width=viewer_width)
 
-            if removal_requests:
-                st.session_state["selected_ids"] = [
-                    sid for sid in selected_ids if sid not in removal_requests
-                ]
-                st.session_state["selected_id"] = (
-                    st.session_state["selected_ids"][-1]
-                    if st.session_state["selected_ids"]
-                    else None
-                )
-                st.rerun()
+                    if layout_choice == "Tabs" and len(viewer_entries) > 1:
+                        tabs = st.tabs([entry["label"] for entry in viewer_entries])
+                        for tab, entry in zip(tabs, viewer_entries):
+                            with tab:
+                                _render_entry(entry)
+                    else:
+                        per_row = 2
+                        for start in range(0, len(viewer_entries), per_row):
+                            cols = st.columns(
+                                min(per_row, len(viewer_entries) - start)
+                            )
+                            for col, entry in zip(
+                                cols, viewer_entries[start : start + per_row]
+                            ):
+                                with col:
+                                    _render_entry(entry)
+
+                if removal_requests:
+                    st.session_state["selected_ids"] = [
+                        sid for sid in selected_ids if sid not in removal_requests
+                    ]
+                    st.session_state["selected_id"] = (
+                        st.session_state["selected_ids"][-1]
+                        if st.session_state["selected_ids"]
+                        else None
+                    )
+                    st.rerun()
 
             if records_for_tables:
                 records_df = pd.DataFrame(records_for_tables)
                 records_df = records_df.set_index("selection_id")
-                ordered_ids = [
-                    entry["selection_id"] for entry in viewer_entries if "record" in entry
-                ]
-                remaining_ids = [
-                    entry["selection_id"] for entry in viewer_entries if entry.get("error")
-                ]
-                index_order = ordered_ids + remaining_ids
                 index_order = [
-                    sid for sid in index_order if sid in records_df.index
+                    sid for sid in selected_ids if sid in records_df.index
                 ]
                 records_df = records_df.loc[index_order].reset_index()
                 show_multi_details(records_df, atoms_for_tables, theme)
+            if geometry_message is not None:
+                return
         else:
             if source_type == "XYZ Directory":
                 selected_id = xyz_navbar(
@@ -1099,89 +1656,116 @@ def main() -> None:
                 selected_id = navigation_controls(df, selected_id)
 
             record = df.loc[df["selection_id"] == selected_id].iloc[0]
-            has_geometry = bool(record.get("has_geometry", True))
 
-            if not has_geometry:
+            dataset_has_geometry = (
+                bool(df["has_geometry"].astype(bool).any())
+                if "has_geometry" in df.columns
+                else False
+            )
+            viewer_state_key = f"viewer_enabled_{version_key}"
+            default_viewer_enabled = st.session_state.get(viewer_state_key, False)
+            if not dataset_has_geometry and viewer_state_key in st.session_state:
+                st.session_state[viewer_state_key] = False
+            viewer_checkbox = st.checkbox(
+                "Enable 3D viewer",
+                value=default_viewer_enabled if dataset_has_geometry else False,
+                key=viewer_state_key,
+                disabled=not dataset_has_geometry,
+                help="Load molecular geometries on demand."
+                + ("" if dataset_has_geometry else " No geometries detected for this dataset."),
+            )
+            viewer_enabled = bool(viewer_checkbox and dataset_has_geometry)
+
+            if not dataset_has_geometry:
                 st.info(
-                    "No XYZ geometry available for this CSV entry. Nothing to show in the 3D viewer."
+                    "No geometries were detected for this dataset. Use the metadata below instead."
+                )
+                show_details(record, None, theme)
+            elif not viewer_enabled:
+                st.info(
+                    "Enable the 3D viewer above to fetch geometries for the selected structure."
                 )
                 show_details(record, None, theme)
             else:
-                load_start = perf_counter()
-                atoms = get_atoms(record)
-                load_entry = _log_perf(
-                    perf_log,
-                    "load_atoms",
-                    perf_counter() - load_start,
-                    selection=str(record["selection_id"]),
-                    source=str(record["source"]),
-                )
-                if atoms is None:
-                    if load_entry is not None:
-                        load_entry["status"] = "failed"
-                    st.error("Unable to load atoms for the selected entry.")
-                    return
-                display_atoms = filter_hydrogens(
-                    atoms, show_hydrogens=viewer_config["show_hydrogens"]
-                )
-                if len(display_atoms) == 0:
-                    st.warning("No atoms remain after hiding hydrogens for this structure.")
+                has_geometry = bool(record.get("has_geometry", True))
+
+                if not has_geometry:
+                    st.info(
+                        "No XYZ geometry available for this CSV entry. Nothing to show in the 3D viewer."
+                    )
+                    show_details(record, None, theme)
                 else:
-                    if viewer_config["viewer_engine"] == "3Dmol":
-                        html = render_3dmol_view(
-                            display_atoms,
-                            record.label,
-                            theme=theme,
-                            height=720,
-                            width=840,
-                            threedmol_style=viewer_config["threedmol_style"],
-                            threedmol_atom_radius=viewer_config["threedmol_atom_radius"],
-                            threedmol_bond_radius=viewer_config["threedmol_bond_radius"],
-                            label_modes=[viewer_config["atom_label"]] if viewer_config["atom_label"] else None,
-                        )
-                        st.components.v1.html(html, height=720, width=840)
+                    atoms = _load_atoms_cached(
+                        record,
+                        dataset_state,
+                        perf_log,
+                        "load_atoms",
+                    )
+                    if atoms is None:
+                        st.error("Unable to load atoms for the selected entry.")
+                        return
+
+                    display_atoms = filter_hydrogens(
+                        atoms, show_hydrogens=viewer_config["show_hydrogens"]
+                    )
+                    if len(display_atoms) == 0:
+                        st.warning("No atoms remain after hiding hydrogens for this structure.")
                     else:
-                        try:
-                            quality_map = {label: factor for label, factor in SNAPSHOT_QUALITY_OPTIONS}
-                            snapshot_factor = quality_map.get(
-                                viewer_config.get("snapshot_quality", ""), 1
-                            )
-                            snapshot_params = {
-                                "transparent": bool(viewer_config.get("snapshot_transparent", False)),
-                                "factor": snapshot_factor,
-                            }
-                            render_start = perf_counter()
-                            html = render_ngl_view(
+                        if viewer_config["viewer_engine"] == "3Dmol":
+                            html = render_3dmol_view(
                                 display_atoms,
                                 record.label,
                                 theme=theme,
-                                sphere_radius=viewer_config["sphere_radius"],
-                                bond_radius=viewer_config["bond_radius"],
-                                interaction_mode=viewer_config["viewer_mode"],
                                 height=720,
                                 width=840,
-                                representation_style=viewer_config["representation_style"],
-                                label_mode=viewer_config["atom_label"],
-                                snapshot=snapshot_params,
-                            )
-                            _log_perf(
-                                perf_log,
-                                "render_ngl_view",
-                                perf_counter() - render_start,
-                                atoms=int(len(display_atoms)),
-                                label=str(record.label),
+                                threedmol_style=viewer_config["threedmol_style"],
+                                threedmol_atom_radius=viewer_config["threedmol_atom_radius"],
+                                threedmol_bond_radius=viewer_config["threedmol_bond_radius"],
+                                label_modes=[viewer_config["atom_label"]] if viewer_config["atom_label"] else None,
                             )
                             st.components.v1.html(html, height=720, width=840)
-                        except Exception as exc:  # pragma: no cover - defensive
-                            st.error(str(exc))
-                            return
+                        else:
+                            try:
+                                quality_map = {label: factor for label, factor in SNAPSHOT_QUALITY_OPTIONS}
+                                snapshot_factor = quality_map.get(
+                                    viewer_config.get("snapshot_quality", ""), 1
+                                )
+                                snapshot_params = {
+                                    "transparent": bool(viewer_config.get("snapshot_transparent", False)),
+                                    "factor": snapshot_factor,
+                                }
+                                render_start = perf_counter()
+                                html = render_ngl_view(
+                                    display_atoms,
+                                    record.label,
+                                    theme=theme,
+                                    sphere_radius=viewer_config["sphere_radius"],
+                                    bond_radius=viewer_config["bond_radius"],
+                                    interaction_mode=viewer_config["viewer_mode"],
+                                    height=720,
+                                    width=840,
+                                    representation_style=viewer_config["representation_style"],
+                                    label_mode=viewer_config["atom_label"],
+                                    snapshot=snapshot_params,
+                                )
+                                _log_perf(
+                                    perf_log,
+                                    "render_ngl_view",
+                                    perf_counter() - render_start,
+                                    atoms=int(len(display_atoms)),
+                                    label=str(record.label),
+                                )
+                                st.components.v1.html(html, height=720, width=840)
+                            except Exception as exc:  # pragma: no cover - defensive
+                                st.error(str(exc))
+                                return
 
-                show_measurement_panel(
-                    display_atoms,
-                    viewer_config["viewer_mode"],
-                    key_prefix=f"measure_{selected_id}",
-                )
-                show_details(record, display_atoms if len(display_atoms) else atoms, theme)
+                    show_measurement_panel(
+                        display_atoms,
+                        viewer_config["viewer_mode"],
+                        key_prefix=f"measure_{selected_id}",
+                    )
+                    show_details(record, display_atoms if len(display_atoms) else atoms, theme)
 
     with st.expander("Dataset distributions", expanded=False):
         stats_allowed = True
@@ -1198,13 +1782,21 @@ def main() -> None:
                     "Enable the checkbox above to compute them on demand."
                 )
         if stats_allowed:
-            with st.spinner("Computing dataset statistics..."):
-                stats_start = perf_counter()
-                summary_df, elements_df, failures = compute_dataset_statistics(df)
+            compute_needed = dataset_state.setdefault("stats", {}).get("version") != dataset_state.get("version")
+            stats_start = perf_counter()
+            if compute_needed:
+                with st.spinner("Computing dataset statistics..."):
+                    summary_df, elements_df, failures, stats_cached = _get_dataset_statistics(df, dataset_state)
+                duration = perf_counter() - stats_start
+            else:
+                summary_df, elements_df, failures, stats_cached = _get_dataset_statistics(df, dataset_state)
+                duration = 0.0
+            if perf_log is not None:
+                event_name = "dataset_statistics_cache_hit" if stats_cached else "compute_dataset_statistics"
                 _log_perf(
                     perf_log,
-                    "compute_dataset_statistics",
-                    perf_counter() - stats_start,
+                    event_name,
+                    duration,
                     summaries=int(len(summary_df)),
                     failures=int(len(failures)),
                 )

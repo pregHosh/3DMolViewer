@@ -252,6 +252,7 @@ def load_ase_metadata(db_path: str) -> pd.DataFrame:
                     "db_id": row.id,
                     "source": "ase_db",
                     "selection_id": f"ase::{row.id}",
+                    "has_geometry": True,
                     "__index": row.id,
                     **props,
                 }
@@ -292,7 +293,7 @@ def load_atoms_from_ase(db_path: str, row_id: int) -> Atoms:
         return handle.get(id=row_id).toatoms()
 
 def load_atoms_raw(record: pd.Series) -> Atoms:
-    if record.source == "xyz":
+    if record.source in {"xyz", "lite_xyz"}:
         return load_atoms_from_xyz(record.path)
     if record.source == "ase_db":
         return load_atoms_from_ase(record.db_path, int(record.db_id))
