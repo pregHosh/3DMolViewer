@@ -5,6 +5,7 @@ Lite Molecular Viz is a standalone Streamlit application for interactively brows
 
 Intended to be used with [![Code](https://img.shields.io/badge/MolCraftDiffusion-GitHub-red)](https://github.com/pregHosh/MolCraftDiffusion)
 
+The paper: [![arXiv](https://img.shields.io/badge/PDF-arXiv-blue)](https://chemrxiv.org/engage/chemrxiv/article-details/6909e50fef936fb4a23df237)
 
 
 ## Features
